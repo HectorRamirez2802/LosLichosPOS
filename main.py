@@ -170,7 +170,7 @@ class App(ctk.CTk):
         )
         ctk.CTkLabel(
             self.sidebar,
-            text="Sistema Lichos POS v1.4",
+            text="Sistema Lichos POS v1.5",
             font=ctk.CTkFont(size=11),
             text_color=COLORS["muted"]
         ).grid(row=11, column=0, pady=(0, 16))

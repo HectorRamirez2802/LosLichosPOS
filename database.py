@@ -438,6 +438,170 @@ def registrar_venta(items, tipo="contado", cliente="Mostrador", pagado=None,
         conn.close()
 
 
+def agregar_item_venta(venta_id, producto_id, nombre_producto, cantidad,
+                        precio_unitario, nota_item="", precio_ajustado=None):
+    """
+    Agrega un producto a una venta/cuenta YA EXISTENTE (usado para agregar
+    artículos a una cuenta a crédito sin tener que registrar de nuevo al
+    cliente). Descuenta stock y ajusta el total (y subtotal_orig, para no
+    romper el cálculo de descuento general) de la venta.
+
+    precio_unitario  : precio normal (de catálogo) del producto.
+    precio_ajustado  : precio distinto al normal, opcional -- para casos
+                        como producto dañado / sin caja / muestra de piso,
+                        igual que la nota + ajuste de precio del POS.
+    nota_item        : observación del renglón (aparece en el ticket).
+
+    Si el producto ya está en la cuenta como renglón "simple" pendiente
+    (no liquidado, no entregado, sin nota ni precio ajustado, mismo precio
+    unitario) Y este agregado tampoco trae nota/ajuste, se suma la cantidad
+    a ese renglón en lugar de crear uno nuevo -- por ejemplo, si el cliente
+    ya tenía 1 Coca en la cuenta y compra otra, queda como "Coca ×2" y no
+    como dos productos separados. Un renglón con nota o precio ajustado
+    (p.ej. un producto dañado) siempre se agrega aparte, para no mezclar su
+    precio/observación con el stock normal.
+
+    Devuelve el ID del venta_items afectado (nuevo o el que se fusionó).
+    """
+    precio_efectivo = precio_ajustado if precio_ajustado is not None else precio_unitario
+    subtotal = cantidad * precio_efectivo
+    tiene_nota_o_ajuste = bool((nota_item or "").strip()) or precio_ajustado is not None
+
+    conn = get_connection()
+    try:
+        venta = conn.execute(
+            "SELECT total, subtotal_orig FROM ventas WHERE id = ?",
+            (venta_id,)
+        ).fetchone()
+        if venta is None:
+            raise ValueError(f"La venta/cuenta {venta_id} no existe.")
+
+        # Si la cuenta nunca tuvo un descuento general (subtotal_orig en 0,
+        # dato legado), la sincronizamos con el total actual antes de sumar,
+        # para no generar un "descuento" fantasma al dividir total/subtotal.
+        subtotal_orig_actual = venta["subtotal_orig"] or 0
+        if subtotal_orig_actual <= 0:
+            subtotal_orig_actual = venta["total"]
+
+        # ── Buscar renglón existente para fusionar (mismo producto, aún
+        #    "simple": sin liquidar, sin entregar, sin nota/precio ajustado,
+        #    mismo precio unitario) -- solo si este agregado tampoco trae
+        #    nota ni ajuste de precio ────────────────────────────────────
+        existente = None
+        if not tiene_nota_o_ajuste:
+            existente = conn.execute("""
+                SELECT id, cantidad, subtotal FROM venta_items
+                WHERE venta_id = ? AND producto_id = ?
+                  AND liquidado = 0 AND entregado = 0
+                  AND (nota_item IS NULL OR nota_item = '')
+                  AND precio_ajustado IS NULL
+                  AND precio_unitario = ?
+                ORDER BY id DESC LIMIT 1
+            """, (venta_id, producto_id, precio_efectivo)).fetchone()
+
+        if existente:
+            item_id = existente["id"]
+            conn.execute("""
+                UPDATE venta_items
+                SET cantidad = cantidad + ?, subtotal = subtotal + ?
+                WHERE id = ?
+            """, (cantidad, subtotal, item_id))
+        else:
+            cursor = conn.execute("""
+                INSERT INTO venta_items
+                    (venta_id, producto_id, nombre_producto, cantidad,
+                     precio_unitario, subtotal, nota_item, precio_ajustado)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (venta_id, producto_id, nombre_producto, cantidad,
+                  precio_efectivo, subtotal, nota_item or "", precio_ajustado))
+            item_id = cursor.lastrowid
+
+        resultado = conn.execute(
+            "UPDATE productos SET stock = stock - ? WHERE id = ? AND stock >= ?",
+            (cantidad, producto_id, cantidad)
+        )
+        if resultado.rowcount == 0:
+            raise ValueError(
+                f"Stock insuficiente para '{nombre_producto}' "
+                f"(se intentó descontar {cantidad} unidades)."
+            )
+
+        conn.execute(
+            "UPDATE ventas SET total = total + ?, subtotal_orig = ? WHERE id = ?",
+            (subtotal, subtotal_orig_actual + subtotal, venta_id)
+        )
+
+        conn.commit()
+        return item_id
+
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+
+def eliminar_item_venta(item_id):
+    """
+    Quita un producto de una cuenta (por ejemplo, si se agregó por error).
+    Restaura el stock y resta el importe del total (y subtotal_orig) de
+    la venta.
+
+    Solo permite quitar renglones pendientes: si el producto ya fue
+    liquidado o entregado, se rechaza para no descuadrar los pagos/entregas
+    ya registrados; en ese caso primero hay que revertir la liquidación o
+    la entrega desde su propio diálogo.
+    """
+    conn = get_connection()
+    try:
+        item = conn.execute(
+            "SELECT * FROM venta_items WHERE id = ?", (item_id,)
+        ).fetchone()
+        if item is None:
+            raise ValueError("El producto ya no existe en esta cuenta.")
+
+        if item["liquidado"]:
+            raise ValueError(
+                "Este producto ya fue liquidado y no se puede quitar. "
+                "Si fue un error, primero reviértelo desde el historial de abonos."
+            )
+        if item["entregado"]:
+            raise ValueError(
+                "Este producto ya fue marcado como entregado y no se puede quitar. "
+                "Primero desmarca la entrega desde el registro de entrega."
+            )
+
+        venta = conn.execute(
+            "SELECT total, subtotal_orig FROM ventas WHERE id = ?",
+            (item["venta_id"],)
+        ).fetchone()
+
+        subtotal_orig_actual = venta["subtotal_orig"] or 0
+        if subtotal_orig_actual <= 0:
+            subtotal_orig_actual = venta["total"]
+        nuevo_subtotal_orig = max(subtotal_orig_actual - item["subtotal"], 0)
+        nuevo_total = max(venta["total"] - item["subtotal"], 0)
+
+        conn.execute(
+            "UPDATE productos SET stock = stock + ? WHERE id = ?",
+            (item["cantidad"], item["producto_id"])
+        )
+        conn.execute("DELETE FROM venta_items WHERE id = ?", (item_id,))
+        conn.execute(
+            "UPDATE ventas SET total = ?, subtotal_orig = ? WHERE id = ?",
+            (nuevo_total, nuevo_subtotal_orig, item["venta_id"])
+        )
+
+        conn.commit()
+        return True
+
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+
 def _fecha_hasta_exclusiva(fecha_hasta: str | None) -> str | None:
     if not fecha_hasta:
         return None

@@ -3,6 +3,7 @@ import database as db
 from tkinter import messagebox, ttk
 import tkinter as tk
 from views import ticket as tkt
+from views.pos import DialogoNotaProducto
 
 # ─── COLORES ──────────────────────────────────────────────────────────────────
 C = {
@@ -456,6 +457,237 @@ class EntregaDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+# ─── DIÁLOGO AGREGAR PRODUCTO A CUENTA EXISTENTE ──────────────────────────────
+class AgregarProductoDialog(ctk.CTkToplevel):
+    """
+    Permite agregar un producto nuevo a una cuenta a crédito ya existente,
+    sin tener que registrar de nuevo al cliente (nombre/teléfono).
+    También permite, igual que en el POS, dejar una observación y/o ajustar
+    el precio del renglón (p. ej. producto dañado, sin caja, muestra de piso).
+    """
+    def __init__(self, parent, venta_id, on_guardado):
+        super().__init__(parent)
+        self.venta_id    = venta_id
+        self.on_guardado = on_guardado
+        self._producto_sel   = None
+        self._nota            = ""
+        self._precio_ajustado = None
+
+        self.title("Agregar producto a la cuenta")
+        self.geometry("420x520")
+        self.resizable(False, False)
+        self.configure(fg_color=C["bg"])
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+        self._build()
+
+    def _build(self):
+        self.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            self, text="Agregar producto",
+            font=ctk.CTkFont(size=15, weight="bold"), text_color=C["text"]
+        ).grid(row=0, column=0, padx=24, pady=(22, 2), sticky="w")
+
+        ctk.CTkLabel(
+            self, text="Se sumará a esta cuenta como saldo pendiente.",
+            font=ctk.CTkFont(size=12), text_color=C["muted"]
+        ).grid(row=1, column=0, padx=24, pady=(0, 14), sticky="w")
+
+        # ── Buscador de producto ────────────────────────────────────────────
+        ctk.CTkLabel(
+            self, text="Producto:",
+            font=ctk.CTkFont(size=11), text_color=C["muted"]
+        ).grid(row=2, column=0, padx=24, sticky="w", pady=(0, 4))
+
+        self.e_buscar = ctk.CTkEntry(
+            self, placeholder_text="Buscar por nombre…",
+            height=38, fg_color=C["surface"], border_color=C["border"],
+            text_color=C["text"], font=ctk.CTkFont(size=13)
+        )
+        self.e_buscar.grid(row=3, column=0, padx=24, sticky="ew")
+        self.e_buscar.bind("<KeyRelease>", self._buscar)
+
+        self._lista_frame = ctk.CTkFrame(self, fg_color=C["surface"], corner_radius=8, height=1)
+        self._lista_frame.grid(row=4, column=0, padx=24, pady=(4, 0), sticky="ew")
+        self._lista_frame.grid_remove()   # oculto hasta que haya una búsqueda con resultados
+
+        self._lbl_sel = ctk.CTkLabel(
+            self, text="Ningún producto seleccionado",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color=C["muted"]
+        )
+        self._lbl_sel.grid(row=5, column=0, padx=24, pady=(12, 0), sticky="w")
+
+        # ── Cantidad ──────────────────────────────────────────────────────────
+        ctk.CTkLabel(
+            self, text="Cantidad:",
+            font=ctk.CTkFont(size=11), text_color=C["muted"]
+        ).grid(row=6, column=0, padx=24, sticky="w", pady=(14, 4))
+
+        self.e_cantidad = ctk.CTkEntry(
+            self, height=38, fg_color=C["surface"], border_color=C["border"],
+            text_color=C["text"], font=ctk.CTkFont(size=13)
+        )
+        self.e_cantidad.insert(0, "1")
+        self.e_cantidad.grid(row=7, column=0, padx=24, sticky="ew")
+
+        # ── Nota / ajuste de precio (producto dañado, sin caja, etc.) ────────
+        nota_row = ctk.CTkFrame(self, fg_color="transparent")
+        nota_row.grid(row=8, column=0, padx=24, pady=(16, 0), sticky="ew")
+        nota_row.grid_columnconfigure(0, weight=1)
+
+        self._btn_nota = ctk.CTkButton(
+            nota_row, text="📝  Nota / ajuste de precio", height=36,
+            fg_color=C["surface2"], hover_color=C["border"],
+            text_color=C["text"], font=ctk.CTkFont(size=12),
+            corner_radius=6, command=self._abrir_nota
+        )
+        self._btn_nota.grid(row=0, column=0, sticky="ew")
+
+        self._lbl_nota_estado = ctk.CTkLabel(
+            self, text="Sin observación ni ajuste de precio",
+            font=ctk.CTkFont(size=11), text_color=C["muted"],
+            wraplength=372, justify="left", anchor="w"
+        )
+        self._lbl_nota_estado.grid(row=9, column=0, padx=24, pady=(6, 0), sticky="w")
+
+        # ── Botones ───────────────────────────────────────────────────────────
+        btn_f = ctk.CTkFrame(self, fg_color="transparent")
+        btn_f.grid(row=10, column=0, padx=24, pady=(22, 24), sticky="ew")
+        btn_f.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkButton(
+            btn_f, text="Agregar", height=40,
+            fg_color=C["accent"], hover_color="#8ba3ff",
+            text_color="#fff", font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._guardar
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            btn_f, text="Cancelar", height=40,
+            fg_color=C["surface2"], hover_color=C["surface"],
+            text_color=C["muted"], font=ctk.CTkFont(size=13),
+            command=self.destroy
+        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
+
+    def _buscar(self, _event=None):
+        for w in self._lista_frame.winfo_children():
+            w.destroy()
+
+        texto = self.e_buscar.get().strip()
+        if not texto:
+            self._lista_frame.grid_remove()
+            return
+
+        resultados = db.buscar_por_nombre(texto)
+        if not resultados:
+            self._lista_frame.grid()
+            ctk.CTkLabel(
+                self._lista_frame, text="Sin resultados",
+                font=ctk.CTkFont(size=12), text_color=C["muted"]
+            ).pack(padx=10, pady=8, anchor="w")
+            return
+
+        self._lista_frame.grid()
+        for prod in resultados:
+            fila = ctk.CTkButton(
+                self._lista_frame,
+                text=f"{prod['nombre']}   ·   ${prod['precio']:.2f}   ·   stock {prod['stock']}",
+                anchor="w", height=32,
+                fg_color="transparent", hover_color=C["surface2"],
+                text_color=C["text"], font=ctk.CTkFont(size=12),
+                command=lambda p=prod: self._seleccionar(p)
+            )
+            fila.pack(fill="x", padx=4, pady=1)
+
+    def _seleccionar(self, producto):
+        self._producto_sel = producto
+        self.e_buscar.delete(0, "end")
+        self.e_buscar.insert(0, producto["nombre"])
+        self._lista_frame.grid_remove()
+        self._lbl_sel.configure(
+            text=f"✔ {producto['nombre']}  ·  ${producto['precio']:.2f} c/u  ·  stock disponible: {producto['stock']}",
+            text_color=C["green"]
+        )
+        # Cambiar de producto invalida cualquier nota/ajuste previo, ya que
+        # el precio de referencia era el del producto anterior.
+        self._nota = ""
+        self._precio_ajustado = None
+        self._actualizar_estado_nota()
+
+    def _abrir_nota(self):
+        if not self._producto_sel:
+            messagebox.showerror("Error", "Primero selecciona un producto de la lista.", parent=self)
+            return
+        DialogoNotaProducto(
+            self,
+            nombre_producto        = self._producto_sel["nombre"],
+            precio_original        = self._producto_sel["precio"],
+            nota_actual             = self._nota,
+            precio_ajustado_actual  = self._precio_ajustado,
+            on_guardar              = self._aplicar_nota,
+        )
+
+    def _aplicar_nota(self, nota, precio_ajustado):
+        self._nota = nota
+        self._precio_ajustado = precio_ajustado
+        self._actualizar_estado_nota()
+
+    def _actualizar_estado_nota(self):
+        partes = []
+        if self._nota:
+            partes.append(f"📝 {self._nota}")
+        if self._precio_ajustado is not None:
+            partes.append(f"Precio ajustado: ${self._precio_ajustado:.2f}")
+        if partes:
+            self._lbl_nota_estado.configure(
+                text="   ·   ".join(partes), text_color=C["yellow"]
+            )
+        else:
+            self._lbl_nota_estado.configure(
+                text="Sin observación ni ajuste de precio", text_color=C["muted"]
+            )
+
+    def _guardar(self):
+        if not self._producto_sel:
+            messagebox.showerror("Error", "Selecciona un producto de la lista.", parent=self)
+            return
+
+        try:
+            cantidad = int(self.e_cantidad.get().strip())
+            if cantidad <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Ingresa una cantidad válida.", parent=self)
+            return
+
+        if cantidad > self._producto_sel["stock"]:
+            messagebox.showerror(
+                "Error",
+                f"Stock insuficiente. Disponible: {self._producto_sel['stock']}.",
+                parent=self
+            )
+            return
+
+        try:
+            db.agregar_item_venta(
+                venta_id=self.venta_id,
+                producto_id=self._producto_sel["id"],
+                nombre_producto=self._producto_sel["nombre"],
+                cantidad=cantidad,
+                precio_unitario=self._producto_sel["precio"],
+                nota_item=self._nota,
+                precio_ajustado=self._precio_ajustado,
+            )
+        except Exception as e:
+            messagebox.showerror("Error", str(e), parent=self)
+            return
+
+        self.on_guardado()
+        self.destroy()
+
+
 # ─── DIÁLOGO EDITAR ABONO ─────────────────────────────────────────────────────
 class EditarAbonoDialog(ctk.CTkToplevel):
     """
@@ -743,7 +975,20 @@ class DetalleCuenta(ctk.CTkToplevel):
         self._lbl_restante.pack(anchor="w", padx=16, pady=(0, 10))
 
         # ── Productos comprados ───────────────────────────────────────────────
-        self._seccion(p, "PRODUCTOS COMPRADOS")
+        seccion_prod = ctk.CTkFrame(p, fg_color="transparent")
+        seccion_prod.pack(fill="x", padx=28, pady=(16, 6))
+        ctk.CTkLabel(
+            seccion_prod, text="PRODUCTOS COMPRADOS",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=C["muted"]
+        ).pack(side="left")
+        ctk.CTkButton(
+            seccion_prod, text="➕ Agregar producto", height=26,
+            fg_color=C["surface2"], hover_color=C["border"],
+            text_color=C["accent"], font=ctk.CTkFont(size=11, weight="bold"),
+            corner_radius=6, command=self._abrir_agregar_producto
+        ).pack(side="right")
+
         self._items_frame_container = ctk.CTkFrame(p, fg_color="transparent")
         self._items_frame_container.pack(fill="x", padx=28)
         self._cargar_items(self._items_frame_container)
@@ -1007,16 +1252,62 @@ class DetalleCuenta(ctk.CTkToplevel):
 
         tree.bind("<Double-1>", _on_doble_clic)
 
+        # ── Clic derecho → quitar producto de la cuenta ──────────────────────
+        def _on_clic_derecho(event):
+            iid = tree.identify_row(event.y)
+            if iid and iid in self._items_data:
+                tree.selection_set(iid)
+                self._quitar_item(self._items_data[iid])
+
+        tree.bind("<Button-3>", _on_clic_derecho)
+
         # ── Nota al pie ───────────────────────────────────────────────────────
         ctk.CTkLabel(
             wrapper,
-            text="Doble clic en una fila para registrar / editar entrega",
+            text="Doble clic: registrar/editar entrega   ·   Clic derecho: quitar producto",
             font=ctk.CTkFont(size=10),
             text_color=C["muted"]
         ).pack(anchor="e", padx=10, pady=(0, 6))
 
     def _abrir_entrega(self, item):
         EntregaDialog(self, item=item, on_guardado=self._refresh)
+
+    # ── Quitar un producto de la cuenta (p.ej. se agregó por error) ──────────
+    def _quitar_item(self, item):
+        if item.get("liquidado"):
+            messagebox.showerror(
+                "No se puede quitar",
+                "Este producto ya fue liquidado. Si fue un error, primero "
+                "revierte la liquidación desde el historial de abonos.",
+                parent=self
+            )
+            return
+        if item.get("entregado"):
+            messagebox.showerror(
+                "No se puede quitar",
+                "Este producto ya fue marcado como entregado. Primero "
+                "desmarca la entrega desde su registro (doble clic en la fila).",
+                parent=self
+            )
+            return
+
+        confirmar = messagebox.askyesno(
+            "Quitar producto",
+            f"¿Quitar \"{item['nombre_producto']}\" (×{item['cantidad']}) de esta cuenta?\n\n"
+            f"Se restaurará el stock y se descontará ${item['subtotal']:.2f} del total de la cuenta.",
+            parent=self
+        )
+        if not confirmar:
+            return
+
+        try:
+            db.eliminar_item_venta(item["id"])
+        except Exception as e:
+            messagebox.showerror("Error", str(e), parent=self)
+            return
+
+        self._refresh()
+
 
 
     # ── Renderiza el historial de abonos con desglose ─────────────────────────
@@ -1253,6 +1544,14 @@ class DetalleCuenta(ctk.CTkToplevel):
                 text_color=C["accent"] if tel else C["muted"]
             )
         self.on_abono()
+
+    # ── Abrir diálogo de agregar producto a la cuenta ─────────────────────────
+    def _abrir_agregar_producto(self):
+        AgregarProductoDialog(
+            parent       = self,
+            venta_id     = self.venta["id"],
+            on_guardado  = self._refresh,
+        )
 
     # ── Abrir diálogo de liquidación de producto ──────────────────────────────
     def _abrir_liquidar_producto(self):

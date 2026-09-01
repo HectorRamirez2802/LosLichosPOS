@@ -131,6 +131,15 @@ class VentasView(ctk.CTkFrame):
     - El detalle de productos se carga solo para la venta seleccionada.
     - La búsqueda usa debounce para no consultar/redibujar en cada tecla.
     - Se usa paginación para evitar pintar cientos/miles de registros a la vez.
+
+    FIX (bug de la tabla "achatada" en ciertos equipos):
+    - Antes solo la fila 3 (la tabla) tenía weight=1 y sin minsize, así que en
+      pantallas/ventanas con poca altura disponible, esa fila se comprimía
+      hasta casi desaparecer mientras el resto de secciones (stats, filtros,
+      panel de detalle) se quedaban con su tamaño fijo intacto.
+    - Ahora la fila de la tabla tiene un minsize garantizado y el panel de
+      detalle (que siempre está visible debajo) se hizo más compacto para
+      dejarle más espacio a la tabla principal.
     """
 
     PAGE_SIZE = 100
@@ -139,7 +148,9 @@ class VentasView(ctk.CTkFrame):
         super().__init__(parent, fg_color="transparent")
         self.app = app
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        # FIX: minsize evita que la tabla de ventas colapse en pantallas/ventanas
+        # con poca altura disponible (bug reportado en otros equipos).
+        self.grid_rowconfigure(3, weight=1, minsize=220)
 
         self.page = 1
         self.total_rows = 0
@@ -606,7 +617,9 @@ class VentasView(ctk.CTkFrame):
             table_frame,
             columns=cols,
             show="headings",
-            height=5,
+            # FIX: se reduce de 5 a 3 filas visibles para dejarle más espacio
+            # vertical disponible a la tabla principal de ventas (row 3).
+            height=3,
             style="Detalle.Treeview",
             selectmode="none"
         )
