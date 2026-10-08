@@ -148,9 +148,29 @@ class VentasView(ctk.CTkFrame):
         super().__init__(parent, fg_color="transparent")
         self.app = app
         self.grid_columnconfigure(0, weight=1)
-        # FIX: minsize evita que la tabla de ventas colapse en pantallas/ventanas
-        # con poca altura disponible (bug reportado en otros equipos).
-        self.grid_rowconfigure(3, weight=1, minsize=220)
+        self.grid_rowconfigure(0, weight=1)
+
+        # FIX (equipos con pantallas chicas / de 2016 en adelante):
+        # Antes todo el contenido (stats, filtros, tabla de ventas y tabla de
+        # detalle) vivía directo en "self", repartiendo la altura disponible
+        # con pesos y "minsize" por fila. Eso funciona bien cuando la ventana
+        # tiene bastante alto, pero en un equipo con una pantalla más chica
+        # (o con menos resolución vertical disponible) esas filas terminaban
+        # aplastadas — sobre todo la tabla de detalle de productos, que se
+        # quedaba diminuta.
+        #
+        # Ahora todo el módulo vive dentro de un CTkScrollableFrame. Esto
+        # garantiza que en CUALQUIER equipo, sin importar la resolución:
+        #   - Si hay espacio suficiente, se ve todo de corrido, sin necesidad
+        #     de hacer scroll (igual que antes).
+        #   - Si el equipo tiene una pantalla chica y no alcanza el espacio,
+        #     en vez de aplastar las tablas hasta hacerlas ilegibles, aparece
+        #     una barra de scroll vertical y el usuario puede desplazarse.
+        # Además, la tabla de detalle de productos ahora tiene más altura por
+        # defecto (ver _build_detalle), para que se vea más grande siempre.
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.scroll.grid(row=0, column=0, sticky="nsew")
+        self.scroll.grid_columnconfigure(0, weight=1)
 
         self.page = 1
         self.total_rows = 0
@@ -199,7 +219,7 @@ class VentasView(ctk.CTkFrame):
     #  ESTADÍSTICAS
     # ════════════════════════════════════════════════════════════════════════
     def _build_stats(self):
-        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame = ctk.CTkFrame(self.scroll, fg_color="transparent")
         frame.grid(row=0, column=0, sticky="ew", pady=(0, 16))
         frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
@@ -232,7 +252,7 @@ class VentasView(ctk.CTkFrame):
     #  FILTROS
     # ════════════════════════════════════════════════════════════════════════
     def _build_toolbar(self):
-        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame = ctk.CTkFrame(self.scroll, fg_color="transparent")
         frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
         frame.grid_columnconfigure(0, weight=1)
 
@@ -423,7 +443,7 @@ class VentasView(ctk.CTkFrame):
     #  ACCIONES PRINCIPALES
     # ════════════════════════════════════════════════════════════════════════
     def _build_actions(self):
-        frame = ctk.CTkFrame(self, fg_color=C["surface"], corner_radius=10)
+        frame = ctk.CTkFrame(self.scroll, fg_color=C["surface"], corner_radius=10)
         frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         frame.grid_columnconfigure(0, weight=1)
 
@@ -463,7 +483,7 @@ class VentasView(ctk.CTkFrame):
     def _build_tabla(self):
         self._configurar_estilo_treeview()
 
-        cont = ctk.CTkFrame(self, fg_color=C["surface"], corner_radius=10)
+        cont = ctk.CTkFrame(self.scroll, fg_color=C["surface"], corner_radius=10)
         cont.grid(row=3, column=0, sticky="nsew")
         cont.grid_columnconfigure(0, weight=1)
         cont.grid_rowconfigure(0, weight=1)
@@ -477,6 +497,11 @@ class VentasView(ctk.CTkFrame):
             columns=columns,
             show="headings",
             selectmode="browse",
+            # FIX: altura explícita en filas. Ahora que la vista completa usa
+            # scroll propio (ver __init__), esta tabla ya no depende de un
+            # "weight" de fila para estirarse — con esto se asegura un
+            # tamaño generoso y consistente en cualquier equipo/resolución.
+            height=14,
             style="Ventas.Treeview"
         )
 
@@ -508,7 +533,7 @@ class VentasView(ctk.CTkFrame):
         self.tree.bind("<Return>", lambda _e: self._ver_productos_seleccion())
         self.tree.bind("<Delete>", lambda _e: self._eliminar_sel())
 
-        pag = ctk.CTkFrame(self, fg_color="transparent")
+        pag = ctk.CTkFrame(self.scroll, fg_color="transparent")
         pag.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         pag.grid_columnconfigure(1, weight=1)
 
@@ -567,15 +592,18 @@ class VentasView(ctk.CTkFrame):
             background=C["bg"],
             foreground=C["text"],
             fieldbackground=C["bg"],
-            rowheight=28,
-            font=("Segoe UI", 10),
+            # FIX: fila y letra un poco más grandes que antes (28→32, 10→11)
+            # para que la tabla de detalle de productos se vea más grande y
+            # legible, incluso en monitores viejos/de menor resolución.
+            rowheight=32,
+            font=("Segoe UI", 11),
         )
         style.configure(
             "Detalle.Treeview.Heading",
             background=C["surface2"],
             foreground=C["muted"],
             relief="flat",
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 10, "bold"),
         )
         style.map(
             "Detalle.Treeview",
@@ -587,9 +615,10 @@ class VentasView(ctk.CTkFrame):
     #  PANEL DE DETALLE — SOLO UNA VENTA A LA VEZ
     # ════════════════════════════════════════════════════════════════════════
     def _build_detalle(self):
-        self.detalle = ctk.CTkFrame(self, fg_color=C["surface"], corner_radius=10)
-        self.detalle.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        self.detalle = ctk.CTkFrame(self.scroll, fg_color=C["surface"], corner_radius=10)
+        self.detalle.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
         self.detalle.grid_columnconfigure(0, weight=1)
+        self.detalle.grid_rowconfigure(1, weight=1)  # fila de la tabla de productos
 
         top = ctk.CTkFrame(self.detalle, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
@@ -609,17 +638,25 @@ class VentasView(ctk.CTkFrame):
         self.lbl_descuento.grid(row=0, column=1, sticky="e")
 
         table_frame = ctk.CTkFrame(self.detalle, fg_color=C["bg"], corner_radius=8)
-        table_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        table_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
         table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
 
         cols = ("producto", "precio", "cantidad", "subtotal", "detalle")
         self.detalle_tree = ttk.Treeview(
             table_frame,
             columns=cols,
             show="headings",
-            # FIX: se reduce de 5 a 3 filas visibles para dejarle más espacio
-            # vertical disponible a la tabla principal de ventas (row 3).
-            height=3,
+            # FIX (tabla de detalle muy chica en equipos de menor resolución,
+            # ej. 2016): antes esta tabla mostraba solo 4 filas de "altura de
+            # referencia" y dependía de heredar espacio extra de un "weight"
+            # en la fila de más arriba, que en pantallas chicas casi no le
+            # tocaba nada. Ahora, como la vista completa tiene su propio
+            # scroll (ver __init__), esta tabla puede tener una altura fija y
+            # generosa de 8 filas SIEMPRE, se vea en el equipo que se vea. Si
+            # una venta tiene más de 8 productos, la barra de scroll interna
+            # (más abajo) permite ver el resto sin problema.
+            height=8,
             style="Detalle.Treeview",
             selectmode="none"
         )
@@ -636,7 +673,7 @@ class VentasView(ctk.CTkFrame):
 
         det_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.detalle_tree.yview)
         self.detalle_tree.configure(yscrollcommand=det_scroll.set)
-        self.detalle_tree.grid(row=0, column=0, sticky="ew", padx=(8, 0), pady=8)
+        self.detalle_tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
         det_scroll.grid(row=0, column=1, sticky="ns", pady=8, padx=(0, 8))
 
         self._limpiar_detalle()

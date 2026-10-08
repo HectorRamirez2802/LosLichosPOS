@@ -1,6 +1,29 @@
 import customtkinter as ctk
 from PIL import Image, ImageTk
 import os
+import sys
+
+# ─── DPI AWARENESS (Windows) ──────────────────────────────────────────────────
+# FIX (equipos viejos / distintas resoluciones): sin esto, en muchos equipos
+# con Windows (sobre todo equipos de oficina más antiguos, ej. 2016, con
+# configuraciones de escalado de texto distintas a 100%) Windows "escala" la
+# ventana completa como si fuera una imagen en vez de dejar que la app dibuje
+# a resolución nativa. Esto hace que las tablas y textos se vean más chicos,
+# borrosos o desproporcionados respecto a como se ven en un equipo moderno.
+# Declarar el proceso como "DPI aware" evita ese reescalado automático y hace
+# que el tamaño se vea consistente en cualquier equipo. No tiene efecto en
+# Mac/Linux, por eso va protegido con try/except.
+if sys.platform.startswith("win"):
+    try:
+        import ctypes
+        try:
+            # Windows 8.1+ : PROCESS_PER_MONITOR_DPI_AWARE
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            # Windows Vista/7/versiones viejas de Windows 10
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 # ─── LOGGING (primero que todo lo demás) ──────────────────────────────────────
 from logger_config import setup_logging, install_global_handler, get_logger
@@ -46,8 +69,50 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("Sistema POS — Los Lichos")
-        self.geometry("1200x700")
-        self.minsize(1000, 600)
+
+        # FIX (adaptar a distintos monitores/equipos, incluyendo equipos
+        # viejos con pantallas más chicas): antes la ventana abría siempre a
+        # un tamaño fijo de 1200x700 sin importar la resolución real del
+        # monitor. En un equipo con una pantalla más chica (o con menos
+        # espacio útil disponible, ej. barra de tareas más grande), ese
+        # tamaño fijo dejaba muy poco margen para que las tablas internas
+        # (historial de ventas, detalle de productos) se acomodaran bien, y
+        # terminaban viéndose aplastadas/muy chicas.
+        #
+        # Ahora se calcula el tamaño según la pantalla real del equipo y la
+        # ventana arranca maximizada (aprovechando toda la pantalla), pero
+        # sin nunca ser más chica que un mínimo utilizable. Así, entre más
+        # pantalla tenga el equipo, más espacio le queda a las tablas; y en
+        # equipos con pantallas chicas, al menos se usa el 100% del espacio
+        # disponible en vez de una ventana fija que podría ser aún más chica
+        # que la pantalla.
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+
+        min_w, min_h = 1000, 600
+        self.minsize(min_w, min_h)
+
+        # Tamaño de respaldo por si no se puede maximizar (algunos entornos
+        # viejos / sin gestor de ventanas completo): 90% de la pantalla,
+        # nunca menor al mínimo utilizable.
+        fallback_w = max(min_w, int(screen_w * 0.9))
+        fallback_h = max(min_h, int(screen_h * 0.9))
+        pos_x = max(0, (screen_w - fallback_w) // 2)
+        pos_y = max(0, (screen_h - fallback_h) // 2)
+        self.geometry(f"{fallback_w}x{fallback_h}+{pos_x}+{pos_y}")
+
+        try:
+            # Windows: maximiza usando el área de trabajo real (respeta la
+            # barra de tareas), que es justo lo que hace falta en equipos
+            # con menos resolución.
+            self.state("zoomed")
+        except Exception:
+            try:
+                # Linux con algunos gestores de ventanas
+                self.attributes("-zoomed", True)
+            except Exception:
+                pass  # se queda con la geometría de respaldo calculada arriba
+
         self.configure(fg_color=COLORS["bg"])
 
         # ── Ícono de ventana / ejecutable ─────────────────────────────────────────────
