@@ -212,6 +212,7 @@ class App(ctk.CTk):
             ("inventario", "📦  Inventario"),
             ("abonos",     "💳  Abonos"),
             ("ventas",     "📋  Historial"),
+            ("devoluciones", "↩  Devoluciones"),
             ("respaldos",  "🗄  Respaldos"),
         ]
         for i, (key, label) in enumerate(nav_items):
@@ -288,6 +289,7 @@ class App(ctk.CTk):
         "inventario": "📦  Inventario",
         "abonos":     "💳  Gestión de Abonos",
         "ventas":     "📋  Historial de Ventas",
+        "devoluciones": "↩  Devoluciones y Reembolsos",
         "respaldos":  "🗄  Respaldos de Base de Datos",
     }
 
@@ -318,6 +320,9 @@ class App(ctk.CTk):
                 elif key == "ventas":
                     from views.ventas import VentasView
                     view = VentasView(self.content_frame, self)
+                elif key == "devoluciones":
+                    from views.devoluciones import DevolucionesView
+                    view = DevolucionesView(self.content_frame, self)
                 elif key == "respaldos":
                     from views.backup_view import BackupView
                     view = BackupView(self.content_frame, self)
@@ -340,6 +345,16 @@ class App(ctk.CTk):
                     log.exception("Error en on_show() de módulo '%s'", key)
 
         self.modulo_actual = view
+
+    def ir_a_devoluciones(self, venta_id=None):
+        """Abre la pestaña Devoluciones (opcionalmente con una venta ya elegida)."""
+        self.mostrar_modulo("devoluciones")
+        vista = self.modulos.get("devoluciones")
+        if vista is not None and venta_id:
+            try:
+                vista.preseleccionar_venta(venta_id)
+            except Exception:
+                log.exception("No se pudo preseleccionar la venta %s en Devoluciones", venta_id)
 
     def _actualizar_info_topbar(self):
         from datetime import datetime

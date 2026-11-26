@@ -95,6 +95,7 @@ def generar_pdf(venta: dict, items: list, ruta: str | None = None,
         + 6 * mm  # separador
         + 18 * mm # totales
         + (20 * mm if abono_info else 0)  # líneas extra del desglose de abono
+        + (8 * mm if abono_info and abono_info.get("fecha_venta") else 0)
         + extra_desc
         + (26 * mm if tiene_garantia else 0)  # aviso garantía proveedor
         + (20 * mm if es_abono else 0)        # leyenda 30 días apartado
@@ -148,6 +149,9 @@ def generar_pdf(venta: dict, items: list, ruta: str | None = None,
     texto(f"Folio: #{venta['id']}", size=7.5, bold=True)
     texto(fecha_fmt, size=7.5, align="right")
     nl(9)
+    if abono_info and abono_info.get("fecha_venta"):
+        texto(f"Fecha de venta: {abono_info['fecha_venta'][:10]}", size=7, color=HexColor("#888888"))
+        nl(8)
 
     cliente = venta.get("cliente", "Mostrador")
     if cliente != "Mostrador":
@@ -670,8 +674,9 @@ def ticket_desde_abono(abono_id: int, abrir: bool = True) -> str:
     abonos_anteriores = conn.execute("""
         SELECT COALESCE(SUM(monto), 0) AS suma
         FROM abonos
-        WHERE venta_id = ? AND fecha < ?
-    """, (abono["venta_id"], abono["fecha"])).fetchone()
+        WHERE venta_id = ?
+          AND (fecha < ? OR (fecha = ? AND id < ?))
+    """, (abono["venta_id"], abono["fecha"], abono["fecha"], abono["id"])).fetchone()
     conn.close()
 
     if not venta:
@@ -703,10 +708,13 @@ def ticket_desde_abono(abono_id: int, abrir: bool = True) -> str:
 
     # Ajustar pagado al momento del abono
     venta_dict["pagado"] = pagado_tras
+    fecha_venta = venta_dict.get("fecha", "")
+    venta_dict["fecha"] = abono["fecha"]
 
     abono_info = {
         "monto":        float(abono["monto"]),
         "pagado_antes": pagado_antes,
+        "fecha_venta":  fecha_venta,
         "producto_liquidado": (abono["nota"] or "") if abono.get("tipo") == "liquidacion" else "",
     }
 

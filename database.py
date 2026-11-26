@@ -1,6 +1,8 @@
 import sqlite3
 import os
-from datetime import datetime, timedelta
+import re
+import unicodedata
+from datetime import datetime, timedelta, date
 
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -106,6 +108,25 @@ def crear_tablas():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS devoluciones (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            venta_id       INTEGER NOT NULL,
+            item_id        INTEGER NOT NULL,
+            producto_id    INTEGER NOT NULL,
+            nombre_producto TEXT NOT NULL,
+            cantidad       INTEGER NOT NULL,
+            importe        REAL NOT NULL DEFAULT 0,
+            subtotal_bruto REAL NOT NULL DEFAULT 0,
+            salida_dinero  REAL NOT NULL DEFAULT 0,
+            motivo         TEXT NOT NULL,
+            fecha          TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            FOREIGN KEY (venta_id) REFERENCES ventas(id),
+            FOREIGN KEY (item_id) REFERENCES venta_items(id),
+            FOREIGN KEY (producto_id) REFERENCES productos(id)
+        )
+    """)
+
 
     _crear_indices(cursor)
 
@@ -129,6 +150,8 @@ def _crear_indices(cursor):
         "CREATE INDEX IF NOT EXISTS idx_venta_items_producto ON venta_items(producto_id)",
         "CREATE INDEX IF NOT EXISTS idx_abonos_venta_fecha ON abonos(venta_id, fecha DESC)",
         "CREATE INDEX IF NOT EXISTS idx_abonos_tipo_venta ON abonos(tipo, venta_id)",
+        "CREATE INDEX IF NOT EXISTS idx_devoluciones_fecha ON devoluciones(fecha)",
+        "CREATE INDEX IF NOT EXISTS idx_devoluciones_item ON devoluciones(item_id)",
     ]
     for sql in indices:
         cursor.execute(sql)
@@ -154,6 +177,31 @@ def migrar_schema():
     conn = get_connection()
     cur  = conn.cursor()
 
+    # Esta tabla también se crea durante crear_tablas(), pero repetirla aquí
+    # permite recuperar bases antiguas o instalaciones donde solo se aplicó
+    # parcialmente la actualización del esquema. Debe existir antes de crear
+    # sus índices y antes de que las vistas ejecuten consultas sobre ella.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS devoluciones (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            venta_id        INTEGER NOT NULL,
+            item_id         INTEGER NOT NULL,
+            producto_id     INTEGER NOT NULL,
+            nombre_producto TEXT    NOT NULL,
+            cantidad        INTEGER NOT NULL,
+            importe         REAL    NOT NULL DEFAULT 0,
+            subtotal_bruto  REAL    NOT NULL DEFAULT 0,
+            salida_dinero   REAL    NOT NULL DEFAULT 0,
+            motivo          TEXT    NOT NULL,
+            fecha           TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+            FOREIGN KEY (venta_id) REFERENCES ventas(id),
+            FOREIGN KEY (item_id) REFERENCES venta_items(id),
+            FOREIGN KEY (producto_id) REFERENCES productos(id)
+        )
+    """)
+
+    _asegurar_tabla_caducidades(cur)
+
     migraciones = [
         ("ALTER TABLE venta_items ADD COLUMN liquidado     INTEGER NOT NULL DEFAULT 0",),
         ("ALTER TABLE venta_items ADD COLUMN entregado     INTEGER NOT NULL DEFAULT 0",),
@@ -169,8 +217,12 @@ def migrar_schema():
         ("ALTER TABLE ventas      ADD COLUMN descuento_etiq  TEXT DEFAULT ''",),
         ("ALTER TABLE venta_items ADD COLUMN nota_item       TEXT DEFAULT ''",),
         ("ALTER TABLE venta_items ADD COLUMN precio_ajustado REAL DEFAULT NULL",),
+        # 1 = producto agregado DESPUÉS de aplicado el descuento de la cuenta:
+        # se cobra a precio completo y no participa del factor de descuento.
+        ("ALTER TABLE venta_items ADD COLUMN sin_descuento INTEGER NOT NULL DEFAULT 0",),
         ("ALTER TABLE ventas      ADD COLUMN telefono        TEXT DEFAULT ''",),
         ("ALTER TABLE abonos      ADD COLUMN item_id         INTEGER DEFAULT NULL",),
+        ("ALTER TABLE devoluciones ADD COLUMN subtotal_bruto REAL NOT NULL DEFAULT 0",),
     ]
     for (sql,) in migraciones:
         try:
@@ -179,9 +231,118 @@ def migrar_schema():
             pass   # columna ya existe → ignorar
 
     _crear_indices(cur)
+    _normalizar_items_con_devolucion_parcial(conn)
 
     conn.commit()
     conn.close()
+
+
+def factor_descuento_venta(venta, items):
+    """
+    Factor de descuento que aplica SOLO a los renglones con descuento.
+
+    El descuento de una cuenta se guarda como un monto único (ventas.
+    descuento_monto). Los productos agregados después (venta_items.
+    sin_descuento = 1) se cobran a precio completo, así que se excluyen
+    del cálculo:  factor = (total - sin_desc) / (subtotal_orig - sin_desc).
+
+    venta : dict/Row con 'subtotal_orig' y 'total'.
+    items : renglones de la venta (dicts con 'subtotal', 'sin_descuento'
+            y opcionalmente 'cantidad_devuelta'; los devueltos se ignoran).
+    """
+    so    = float(venta["subtotal_orig"] or 0)
+    total = float(venta["total"] or 0)
+    if so <= 0:
+        return 1.0
+    sin_desc = sum(
+        float(i.get("subtotal") or 0) for i in items
+        if int(i.get("sin_descuento") or 0) and not int(i.get("cantidad_devuelta") or 0)
+    )
+    base = so - sin_desc
+    if base <= 0.0001:
+        return 1.0
+    return max((total - sin_desc) / base, 0.0)
+
+
+def subtotal_neto_item(item, factor):
+    """Subtotal del renglón ya con descuento (los productos sin_descuento van a precio completo)."""
+    f = 1.0 if int(item.get("sin_descuento") or 0) else factor
+    return round(float(item.get("subtotal") or 0) * f, 2)
+
+
+def _factor_desc_conn(conn, venta_id):
+    """Igual que factor_descuento_venta, leyendo todo de la BD (dentro de una transacción)."""
+    venta = conn.execute(
+        "SELECT subtotal_orig, total FROM ventas WHERE id = ?", (venta_id,)
+    ).fetchone()
+    if venta is None:
+        return 1.0
+    items = [dict(r) for r in conn.execute("""
+        SELECT vi.subtotal, vi.sin_descuento,
+               COALESCE((SELECT SUM(d.cantidad) FROM devoluciones d
+                         WHERE d.item_id = vi.id), 0) AS cantidad_devuelta
+        FROM venta_items vi WHERE vi.venta_id = ?
+    """, (venta_id,)).fetchall()]
+    return factor_descuento_venta(venta, items)
+
+
+def _separar_item_devuelto(conn, item, cantidad_devuelta, subtotal_devuelto):
+    """Separa unidades devueltas de las que aún pertenecen al cliente.
+
+    Conserva el renglón original como histórico devuelto (y mantiene sus
+    referencias en devoluciones) y crea un renglón activo para las unidades
+    restantes. Las unidades activas heredan el estado previo de entrega/pago.
+    """
+    cantidad_original = int(item["cantidad"] or 0)
+    cantidad_devuelta = int(cantidad_devuelta or 0)
+    cantidad_restante = cantidad_original - cantidad_devuelta
+    if cantidad_devuelta <= 0 or cantidad_restante <= 0:
+        return
+
+    subtotal_original = float(item["subtotal"] or 0)
+    subtotal_devuelto = float(subtotal_devuelto or 0)
+    if subtotal_devuelto <= 0:
+        subtotal_devuelto = subtotal_original * cantidad_devuelta / max(cantidad_original, 1)
+    subtotal_devuelto = round(min(max(subtotal_devuelto, 0), subtotal_original), 2)
+    subtotal_restante = round(max(subtotal_original - subtotal_devuelto, 0), 2)
+
+    conn.execute("""
+        UPDATE venta_items
+        SET cantidad = ?, subtotal = ?, liquidado = 0, entregado = 0,
+            entregado_a = '', fecha_entrega = ''
+        WHERE id = ?
+    """, (cantidad_devuelta, subtotal_devuelto, item["id"]))
+    conn.execute("""
+        INSERT INTO venta_items
+            (venta_id, producto_id, nombre_producto, cantidad, precio_unitario,
+             subtotal, liquidado, entregado, entregado_a, fecha_entrega,
+             nota_item, precio_ajustado, sin_descuento)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        item["venta_id"], item["producto_id"], item["nombre_producto"],
+        cantidad_restante, item["precio_unitario"], subtotal_restante,
+        int(item["liquidado"] or 0), int(item["entregado"] or 0),
+        item["entregado_a"] or "", item["fecha_entrega"] or "",
+        item["nota_item"] or "", item["precio_ajustado"],
+        int(item["sin_descuento"] or 0)
+    ))
+
+
+def _normalizar_items_con_devolucion_parcial(conn):
+    """Migra devoluciones parciales ya registradas a renglones separados."""
+    rows = conn.execute("""
+        SELECT vi.*,
+               SUM(d.cantidad) AS cantidad_devuelta,
+               SUM(d.subtotal_bruto) AS subtotal_devuelto
+        FROM venta_items vi
+        JOIN devoluciones d ON d.item_id = vi.id
+        GROUP BY vi.id
+        HAVING SUM(d.cantidad) > 0 AND SUM(d.cantidad) < vi.cantidad
+    """).fetchall()
+    for item in rows:
+        _separar_item_devuelto(
+            conn, item, item["cantidad_devuelta"], item["subtotal_devuelto"]
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -305,6 +466,21 @@ def resumen_productos():
     return row
 
 
+def obtener_categorias():
+    """Categorías registradas: las que usa al menos un producto activo
+    (con o sin stock). Aparecen al dar de alta el primer producto con esa
+    categoría y desaparecen cuando ya no queda ninguno que la use."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT DISTINCT TRIM(categoria) AS categoria
+        FROM productos
+        WHERE activo = 1 AND TRIM(COALESCE(categoria, '')) <> ''
+        ORDER BY categoria COLLATE NOCASE
+    """).fetchall()
+    conn.close()
+    return [r["categoria"] for r in rows]
+
+
 def actualizar_producto(id, codigo_barras, nombre, precio, costo,
                         stock, categoria, stock_minimo):
     conn = get_connection()
@@ -323,6 +499,230 @@ def desactivar_producto(id):
     conn.execute("UPDATE productos SET activo = 0 WHERE id = ?", (id,))
     conn.commit()
     conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CADUCIDADES (solo productos de categoría alimenticia; solo se consulta en Inventario)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Con cuántos días de anticipación se avisa que un producto está por caducar.
+DIAS_ALERTA_CADUCIDAD = 15
+
+# Una categoría se considera "alimenticia" si contiene alguna de estas palabras
+# (sin importar mayúsculas, acentos ni emojis). Para incluir/excluir una
+# categoría, agrega o quita su palabra clave aquí.
+_CLAVES_CATEGORIA_ALIMENTICIA = (
+    "aliment", "despensa", "abarrote", "migaj", "dulc", "golosina", "botana",
+    "snack", "bebida", "refresco", "licor", "lacteo", "embutido", "carne",
+    "fruta", "verdura", "panader", "galleta", "congelad", "comida",
+)
+
+
+def _sin_acentos(texto):
+    texto = unicodedata.normalize("NFKD", str(texto or ""))
+    return "".join(c for c in texto if not unicodedata.combining(c)).lower()
+
+
+def es_categoria_alimenticia(categoria):
+    """True si la categoría (texto libre) corresponde a alimentos/bebidas."""
+    t = _sin_acentos(categoria)
+    return any(clave in t for clave in _CLAVES_CATEGORIA_ALIMENTICIA)
+
+
+def parsear_fecha_usuario(texto):
+    """
+    Convierte lo que escribe el usuario a ISO (AAAA-MM-DD).
+    Acepta DD/MM/AAAA, DD-MM-AAAA, DD/MM/AA y AAAA-MM-DD. Lanza ValueError.
+    """
+    t = (texto or "").strip()
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if m:
+        a, mes, d = int(m[1]), int(m[2]), int(m[3])
+    else:
+        m = re.fullmatch(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4}|\d{2})", t)
+        if not m:
+            raise ValueError("Fecha inválida. Usa el formato DD/MM/AAAA.")
+        d, mes, a = int(m[1]), int(m[2]), int(m[3])
+        if a < 100:
+            a += 2000
+    try:
+        return date(a, mes, d).isoformat()
+    except ValueError:
+        raise ValueError(f"La fecha «{t}» no existe en el calendario.")
+
+
+def formatear_fecha(iso):
+    """AAAA-MM-DD -> DD/MM/AAAA (si no se puede, devuelve el texto tal cual)."""
+    try:
+        return datetime.strptime(str(iso)[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return str(iso or "")
+
+
+def estado_caducidad(fecha_iso, dias=None, hoy=None):
+    """
+    Devuelve (estado, dias_restantes):
+      'caducado'    -> la fecha ya pasó
+      'por_caducar' -> vence hoy o dentro de los próximos `dias` días
+      'ok'          -> falta más que eso
+    """
+    dias = DIAS_ALERTA_CADUCIDAD if dias is None else dias
+    hoy  = hoy or date.today()
+    restantes = (datetime.strptime(str(fecha_iso)[:10], "%Y-%m-%d").date() - hoy).days
+    if restantes < 0:
+        return "caducado", restantes
+    if restantes <= dias:
+        return "por_caducar", restantes
+    return "ok", restantes
+
+
+def _asegurar_tabla_caducidades(conn):
+    """Crea la tabla si no existe (acepta conexión o cursor). Idempotente."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS producto_caducidades (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            producto_id     INTEGER NOT NULL,
+            fecha_caducidad TEXT    NOT NULL,
+            cantidad        INTEGER DEFAULT NULL,
+            FOREIGN KEY (producto_id) REFERENCES productos(id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_caducidades_producto "
+        "ON producto_caducidades(producto_id)"
+    )
+
+
+def obtener_caducidades(producto_id):
+    """Fechas de caducidad de un producto, de la más próxima a la más lejana."""
+    conn = get_connection()
+    try:
+        _asegurar_tabla_caducidades(conn)
+        rows = conn.execute("""
+            SELECT id, fecha_caducidad, cantidad
+            FROM producto_caducidades
+            WHERE producto_id = ?
+            ORDER BY fecha_caducidad ASC, id ASC
+        """, (producto_id,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def obtener_caducidades_productos(producto_ids):
+    """{producto_id: [caducidades ordenadas]} para varios productos en pocas consultas."""
+    ids = [int(i) for i in producto_ids]
+    resultado = {}
+    if not ids:
+        return resultado
+    conn = get_connection()
+    try:
+        _asegurar_tabla_caducidades(conn)
+        for k in range(0, len(ids), 500):
+            lote = ids[k:k + 500]
+            marcas = ",".join("?" * len(lote))
+            for r in conn.execute(f"""
+                SELECT id, producto_id, fecha_caducidad, cantidad
+                FROM producto_caducidades
+                WHERE producto_id IN ({marcas})
+                ORDER BY fecha_caducidad ASC, id ASC
+            """, lote).fetchall():
+                resultado.setdefault(r["producto_id"], []).append(dict(r))
+        return resultado
+    finally:
+        conn.close()
+
+
+def guardar_caducidades(producto_id, caducidades):
+    """
+    Reemplaza las fechas de caducidad de un producto.
+
+    caducidades: lista de dicts {"fecha": 'AAAA-MM-DD' o 'DD/MM/AAAA',
+                                 "cantidad": int | None (opcional)}.
+    Si una misma fecha viene repetida se unifica en un solo renglón
+    (cantidades sumadas; sin cantidad si ninguna la traía).
+    """
+    por_fecha = {}
+    for c in (caducidades or []):
+        iso = parsear_fecha_usuario(c.get("fecha"))
+        cant = c.get("cantidad")
+        if cant in ("", None):
+            cant = None
+        else:
+            cant = int(cant)
+            if cant <= 0:
+                raise ValueError("La cantidad de cada fecha debe ser mayor que cero.")
+        if iso in por_fecha:
+            previa = por_fecha[iso]
+            por_fecha[iso] = None if (previa is None and cant is None) else (previa or 0) + (cant or 0)
+        else:
+            por_fecha[iso] = cant
+
+    conn = get_connection()
+    try:
+        _asegurar_tabla_caducidades(conn)
+        conn.execute("DELETE FROM producto_caducidades WHERE producto_id = ?", (producto_id,))
+        for iso, cant in sorted(por_fecha.items()):
+            conn.execute("""
+                INSERT INTO producto_caducidades (producto_id, fecha_caducidad, cantidad)
+                VALUES (?, ?, ?)
+            """, (producto_id, iso, cant))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def eliminar_caducidad(caducidad_id):
+    """Quita una fecha puntual (p. ej. cuando ese lote ya se vendió o se retiró)."""
+    conn = get_connection()
+    try:
+        _asegurar_tabla_caducidades(conn)
+        conn.execute("DELETE FROM producto_caducidades WHERE id = ?", (caducidad_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def obtener_alertas_caducidad(dias=None, hoy=None):
+    """
+    Fechas ya vencidas o que vencen dentro de los próximos `dias` días.
+
+    Solo cuenta productos activos, de categoría alimenticia y con existencias
+    (si el stock es 0 ya no hay nada que pueda caducar).
+    Devuelve dicts: id, producto_id, nombre, codigo_barras, categoria, stock,
+    fecha_caducidad, cantidad, estado ('caducado'|'por_caducar'), dias_restantes.
+    Ordenados de la fecha más próxima a la más lejana.
+    """
+    dias = DIAS_ALERTA_CADUCIDAD if dias is None else dias
+    hoy  = hoy or date.today()
+    limite = (hoy + timedelta(days=dias)).isoformat()
+    conn = get_connection()
+    try:
+        _asegurar_tabla_caducidades(conn)
+        rows = conn.execute("""
+            SELECT c.id, c.producto_id, c.fecha_caducidad, c.cantidad,
+                   p.nombre, p.codigo_barras, p.categoria, p.stock
+            FROM producto_caducidades c
+            JOIN productos p ON p.id = c.producto_id
+            WHERE p.activo = 1 AND p.stock > 0 AND c.fecha_caducidad <= ?
+            ORDER BY c.fecha_caducidad ASC, p.nombre ASC
+        """, (limite,)).fetchall()
+    finally:
+        conn.close()
+
+    alertas = []
+    for r in rows:
+        if not es_categoria_alimenticia(r["categoria"]):
+            continue
+        estado, restantes = estado_caducidad(r["fecha_caducidad"], dias, hoy)
+        d = dict(r)
+        d["estado"] = estado
+        d["dias_restantes"] = restantes
+        alertas.append(d)
+    return alertas
 
 
 def descontar_stock(producto_id, cantidad):
@@ -470,11 +870,19 @@ def agregar_item_venta(venta_id, producto_id, nombre_producto, cantidad,
     conn = get_connection()
     try:
         venta = conn.execute(
-            "SELECT total, subtotal_orig FROM ventas WHERE id = ?",
+            "SELECT total, subtotal_orig, descuento_monto FROM ventas WHERE id = ?",
             (venta_id,)
         ).fetchone()
         if venta is None:
             raise ValueError(f"La venta/cuenta {venta_id} no existe.")
+
+        # Si la cuenta ya tiene un descuento, el producto nuevo se cobra a
+        # precio completo: se marca sin_descuento para que el descuento
+        # siga aplicando únicamente a los productos originales.
+        sin_desc = 1 if float(venta["descuento_monto"] or 0) > 0 else 0
+        # NOTA: una devolución NO cierra la cuenta. Se pueden seguir agregando
+        # productos aunque ya existan devoluciones en la venta; los renglones
+        # devueltos permanecen bloqueados como historial (ver abajo).
 
         # Si la cuenta nunca tuvo un descuento general (subtotal_orig en 0,
         # dato legado), la sincronizamos con el total actual antes de sumar,
@@ -493,11 +901,15 @@ def agregar_item_venta(venta_id, producto_id, nombre_producto, cantidad,
                 SELECT id, cantidad, subtotal FROM venta_items
                 WHERE venta_id = ? AND producto_id = ?
                   AND liquidado = 0 AND entregado = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM devoluciones d WHERE d.item_id = venta_items.id
+                  )
                   AND (nota_item IS NULL OR nota_item = '')
                   AND precio_ajustado IS NULL
                   AND precio_unitario = ?
+                  AND sin_descuento = ?
                 ORDER BY id DESC LIMIT 1
-            """, (venta_id, producto_id, precio_efectivo)).fetchone()
+            """, (venta_id, producto_id, precio_efectivo, sin_desc)).fetchone()
 
         if existente:
             item_id = existente["id"]
@@ -510,10 +922,12 @@ def agregar_item_venta(venta_id, producto_id, nombre_producto, cantidad,
             cursor = conn.execute("""
                 INSERT INTO venta_items
                     (venta_id, producto_id, nombre_producto, cantidad,
-                     precio_unitario, subtotal, nota_item, precio_ajustado)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     precio_unitario, subtotal, nota_item, precio_ajustado,
+                     sin_descuento)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (venta_id, producto_id, nombre_producto, cantidad,
-                  precio_efectivo, subtotal, nota_item or "", precio_ajustado))
+                  precio_efectivo, subtotal, nota_item or "", precio_ajustado,
+                  sin_desc))
             item_id = cursor.lastrowid
 
         resultado = conn.execute(
@@ -571,6 +985,13 @@ def eliminar_item_venta(item_id):
                 "Primero desmarca la entrega desde el registro de entrega."
             )
 
+        devuelta = conn.execute(
+            "SELECT COALESCE(SUM(cantidad), 0) FROM devoluciones WHERE item_id = ?",
+            (item_id,)
+        ).fetchone()[0]
+        if devuelta:
+            raise ValueError("Este producto ya tiene una devolución registrada y no se puede quitar de la cuenta.")
+
         venta = conn.execute(
             "SELECT total, subtotal_orig FROM ventas WHERE id = ?",
             (item["venta_id"],)
@@ -580,7 +1001,14 @@ def eliminar_item_venta(item_id):
         if subtotal_orig_actual <= 0:
             subtotal_orig_actual = venta["total"]
         nuevo_subtotal_orig = max(subtotal_orig_actual - item["subtotal"], 0)
-        nuevo_total = max(venta["total"] - item["subtotal"], 0)
+        # Lo que realmente se descuenta del total es el importe NETO del
+        # renglón: completo si es un producto agregado sin descuento, o con
+        # el factor de descuento si es uno de los originales.
+        if int(item["sin_descuento"] or 0):
+            neto = float(item["subtotal"])
+        else:
+            neto = round(float(item["subtotal"]) * _factor_desc_conn(conn, item["venta_id"]), 2)
+        nuevo_total = max(venta["total"] - neto, 0)
 
         conn.execute(
             "UPDATE productos SET stock = stock + ? WHERE id = ?",
@@ -588,8 +1016,9 @@ def eliminar_item_venta(item_id):
         )
         conn.execute("DELETE FROM venta_items WHERE id = ?", (item_id,))
         conn.execute(
-            "UPDATE ventas SET total = ?, subtotal_orig = ? WHERE id = ?",
-            (nuevo_total, nuevo_subtotal_orig, item["venta_id"])
+            "UPDATE ventas SET total = ?, subtotal_orig = ?, descuento_monto = ? WHERE id = ?",
+            (nuevo_total, nuevo_subtotal_orig,
+             max(round(nuevo_subtotal_orig - nuevo_total, 2), 0.0), item["venta_id"])
         )
 
         conn.commit()
@@ -673,14 +1102,30 @@ def resumen_ventas(fecha_desde=None, fecha_hasta=None, tipo="todas", texto=""):
         SELECT
             COUNT(*) AS total_ventas,
             COALESCE(SUM(total), 0) AS monto_total,
-            COALESCE(SUM(pagado), 0) AS monto_cobrado
+            COALESCE(SUM(CASE WHEN tipo = 'contado' THEN pagado + COALESCE(
+                (SELECT SUM(d.importe) FROM devoluciones d WHERE d.venta_id = ventas.id), 0
+            ) ELSE 0 END), 0)
+              + COALESCE((SELECT SUM(a.monto) FROM abonos a
+                          JOIN ventas va ON va.id = a.venta_id
+                          WHERE va.tipo = 'abono'
+                            AND (? IS NULL OR a.fecha >= ?)
+                            AND (? IS NULL OR a.fecha < ?)), 0)
+              - COALESCE((SELECT SUM(d.salida_dinero) FROM devoluciones d
+                          JOIN ventas vd ON vd.id = d.venta_id
+                          WHERE vd.tipo = 'contado'
+                            AND (? IS NULL OR d.fecha >= ?)
+                            AND (? IS NULL OR d.fecha < ?)), 0) AS monto_cobrado
         FROM ventas
     """
+    desde_ts = f"{fecha_desde} 00:00:00" if fecha_desde else None
+    hasta_ts = f"{_fecha_hasta_exclusiva(fecha_hasta)} 00:00:00" if fecha_hasta else None
+    mov_params = [desde_ts, desde_ts, hasta_ts, hasta_ts,
+                  desde_ts, desde_ts, hasta_ts, hasta_ts]
     if where:
         sql += " WHERE " + " AND ".join(where)
 
     conn = get_connection()
-    row = conn.execute(sql, params).fetchone()
+    row = conn.execute(sql, mov_params + params).fetchone()
     conn.close()
     return row
 
@@ -705,7 +1150,11 @@ def buscar_cuentas_abono(texto="", solo_pendientes=False, limite=300):
         where.append("pagado < total")
 
     sql = """
-        SELECT *, (total - pagado) AS restante
+        SELECT ventas.*, (total - pagado) AS restante,
+               (SELECT MAX(a.fecha) FROM abonos a
+                WHERE a.venta_id = ventas.id
+                  AND a.tipo IN ('abono', 'liquidacion')
+                  AND a.monto > 0) AS ultimo_abono
         FROM ventas
         WHERE {where}
         ORDER BY fecha DESC
@@ -743,7 +1192,9 @@ def obtener_items_venta(venta_id):
     """
     conn = get_connection()
     rows = conn.execute("""
-        SELECT vi.*, p.categoria
+        SELECT vi.*, p.categoria,
+               COALESCE((SELECT SUM(d.cantidad) FROM devoluciones d
+                         WHERE d.item_id = vi.id), 0) AS cantidad_devuelta
         FROM venta_items vi
         LEFT JOIN productos p ON p.id = vi.producto_id
         WHERE vi.venta_id = ?
@@ -751,6 +1202,505 @@ def obtener_items_venta(venta_id):
     """, (venta_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def obtener_devolucion_item(item_id):
+    """Devuelve cantidad aún retornable y datos contables del renglón de venta."""
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT vi.*, v.tipo AS tipo_venta, v.total AS total_venta,
+                   v.pagado,
+                   CASE WHEN COALESCE(v.subtotal_orig, 0) > 0 THEN v.subtotal_orig
+                        ELSE (SELECT COALESCE(SUM(vix.subtotal), 0) FROM venta_items vix
+                              WHERE vix.venta_id = v.id) END AS subtotal_orig,
+                   v.descuento_monto,
+                   COALESCE((SELECT SUM(d.cantidad) FROM devoluciones d
+                             WHERE d.item_id = vi.id), 0) AS cantidad_devuelta
+                   ,COALESCE((SELECT SUM(d.importe) FROM devoluciones d
+                              WHERE d.item_id = vi.id), 0) AS importe_devuelto
+                   ,COALESCE((SELECT SUM(d.subtotal_bruto) FROM devoluciones d
+                              WHERE d.item_id = vi.id), 0) AS bruto_devuelto
+            FROM venta_items vi
+            JOIN ventas v ON v.id = vi.venta_id
+            WHERE vi.id = ?
+        """, (item_id,)).fetchone()
+        if not row:
+            return None
+        info = dict(row)
+        info["factor_item"] = (
+            1.0 if int(info.get("sin_descuento") or 0)
+            else _factor_desc_conn(conn, info["venta_id"])
+        )
+        return info
+    finally:
+        conn.close()
+
+
+def listar_ventas_devolucion(tipo=None, limite=250):
+    """Ventas recientes candidatas para registrar devolución."""
+    conn = get_connection()
+    try:
+        if tipo:
+            rows = conn.execute("""
+                SELECT id, fecha, cliente, tipo, total, pagado FROM ventas
+                WHERE tipo = ? ORDER BY fecha DESC, id DESC LIMIT ?
+            """, (tipo, int(limite))).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT id, fecha, cliente, tipo, total, pagado FROM ventas
+                ORDER BY fecha DESC, id DESC LIMIT ?
+            """, (int(limite),)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def listar_devoluciones(venta_id=None, limite=200):
+    conn = get_connection()
+    try:
+        if venta_id is None:
+            rows = conn.execute("""
+                SELECT d.*, v.cliente FROM devoluciones d
+                JOIN ventas v ON v.id = d.venta_id
+                ORDER BY d.fecha DESC, d.id DESC LIMIT ?
+            """, (int(limite),)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT d.*, v.cliente FROM devoluciones d
+                JOIN ventas v ON v.id = d.venta_id
+                WHERE d.venta_id = ? ORDER BY d.fecha DESC, d.id DESC LIMIT ?
+            """, (int(venta_id), int(limite))).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _aplicar_devolucion_en_conn(conn, item_id, cantidad, motivo, fecha):
+    """Núcleo de una devolución dentro de una transacción YA abierta.
+
+    No hace commit ni inserta el movimiento negativo en abonos (eso lo decide
+    quien llama, para poder agrupar varios productos en un solo reembolso).
+    Devuelve un dict con el detalle de la línea.
+
+    Regla contable (cuentas a crédito): el dinero abonado pertenece a la CUENTA,
+    no a un producto. Al devolver productos baja el total de la cuenta y el
+    reembolso es solo lo abonado que excede ese nuevo total:
+        reembolso = max(pagado - nuevo_total, 0)
+    """
+    item = conn.execute("""
+        SELECT vi.*, v.tipo AS tipo_venta, v.total AS total_venta,
+               v.pagado, v.subtotal_orig
+        FROM venta_items vi JOIN ventas v ON v.id = vi.venta_id
+        WHERE vi.id = ?
+    """, (item_id,)).fetchone()
+    if not item:
+        raise ValueError("No se encontró el producto de la venta.")
+    devuelta = conn.execute(
+        "SELECT COALESCE(SUM(cantidad), 0) FROM devoluciones WHERE item_id = ?",
+        (item_id,)
+    ).fetchone()[0]
+    disponible = int(item["cantidad"]) - int(devuelta or 0)
+    if cantidad > disponible:
+        raise ValueError(
+            f"Solo quedan {disponible} unidad(es) de '{item['nombre_producto']}' disponibles para devolver."
+        )
+
+    bruto = round(float(item["subtotal"]) / max(int(item["cantidad"]), 1) * cantidad, 2)
+    subtotal_orig = float(item["subtotal_orig"] or 0)
+    total_venta = float(item["total_venta"] or 0)
+    if subtotal_orig <= 0:
+        subtotal_orig = float(conn.execute(
+            "SELECT COALESCE(SUM(subtotal), 0) FROM venta_items WHERE venta_id = ?",
+            (item["venta_id"],)
+        ).fetchone()[0] or 0)
+    bruto_devuelto_item = conn.execute(
+        "SELECT COALESCE(SUM(subtotal_bruto), 0) FROM devoluciones WHERE item_id = ?",
+        (item_id,)
+    ).fetchone()[0]
+    # Factor propio del renglón: los productos agregados después del
+    # descuento (sin_descuento) se devuelven a precio completo.
+    if int(item["sin_descuento"] or 0):
+        factor = 1.0
+    else:
+        factor = _factor_desc_conn(conn, item["venta_id"])
+    importe = round(bruto * factor, 2)
+    nuevo_total = max(round(total_venta - importe, 2), 0.0)
+    nuevo_subtotal = max(round(subtotal_orig - bruto, 2), 0.0)
+    pagado = float(item["pagado"] or 0)
+    es_credito = item["tipo_venta"] != "contado"
+    salida = max(round(pagado - nuevo_total, 2), 0.0) if es_credito else importe
+    nuevo_pagado = max(0.0, round(pagado - salida, 2)) if es_credito else nuevo_total
+
+    conn.execute("UPDATE productos SET stock = stock + ? WHERE id = ?",
+                 (cantidad, item["producto_id"]))
+    conn.execute("""
+        UPDATE ventas
+        SET total = ?, subtotal_orig = ?, descuento_monto = ?, pagado = ?
+        WHERE id = ?
+    """, (nuevo_total, nuevo_subtotal, max(round(nuevo_subtotal - nuevo_total, 2), 0.0),
+          nuevo_pagado, item["venta_id"]))
+
+    conn.execute("""
+        INSERT INTO devoluciones
+            (venta_id, item_id, producto_id, nombre_producto, cantidad,
+             importe, subtotal_bruto, salida_dinero, motivo, fecha)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (item["venta_id"], item_id, item["producto_id"], item["nombre_producto"],
+          cantidad, importe, bruto, salida, motivo, fecha))
+
+    cantidad_devuelta_total = int(devuelta or 0) + cantidad
+    subtotal_devuelto_total = float(bruto_devuelto_item or 0) + bruto
+    if cantidad_devuelta_total < int(item["cantidad"]):
+        # Divide el renglón: la porción devuelta queda bloqueada y el
+        # remanente conserva su propio ID y puede entregarse/liquidarse.
+        _separar_item_devuelto(
+            conn, item, cantidad_devuelta_total, subtotal_devuelto_total
+        )
+    else:
+        conn.execute("""
+            UPDATE venta_items
+            SET liquidado = 0, entregado = 0, entregado_a = '', fecha_entrega = ''
+            WHERE id = ?
+        """, (item_id,))
+
+    return {
+        "venta_id": item["venta_id"], "item_id": item_id,
+        "nombre": item["nombre_producto"], "cantidad": cantidad,
+        "importe": importe, "salida": salida, "tipo_venta": item["tipo_venta"],
+        "nuevo_total": nuevo_total, "nuevo_pagado": nuevo_pagado,
+    }
+
+
+def _normalizar_selecciones(selecciones):
+    """Valida [(item_id, cantidad), ...] y devuelve una lista limpia sin repetidos."""
+    if not selecciones:
+        raise ValueError("Selecciona al menos un producto para devolver.")
+    limpias, vistos = [], set()
+    for item_id, cantidad in selecciones:
+        try:
+            item_id = int(item_id)
+            cantidad = int(cantidad)
+        except (TypeError, ValueError):
+            raise ValueError("La cantidad debe ser un número entero.")
+        if cantidad <= 0:
+            raise ValueError("La cantidad debe ser mayor que cero.")
+        if item_id in vistos:
+            raise ValueError("Un mismo producto está repetido en la selección.")
+        vistos.add(item_id)
+        limpias.append((item_id, cantidad))
+    return limpias
+
+
+def _devolver_lote_en_conn(conn, selecciones, motivo, fecha, reembolso_deseado=None):
+    """Aplica varias devoluciones de UNA misma venta y arma el resultado agregado.
+
+    reembolso_deseado: solo cuentas a crédito. Dinero total que el cajero entregará
+    al cliente; por defecto es el mínimo automático (lo abonado que excede el nuevo
+    total). Puede ser mayor —hasta el crédito libre de la cuenta— cuando el cliente
+    pide que le regresen dinero aunque aún le quede saldo por pagar (p. ej. pagó
+    un producto en específico, lo devuelve y no quiere dejar ese dinero abonado
+    para los demás). El excedente aumenta el saldo pendiente de la cuenta."""
+    selecciones = _normalizar_selecciones(selecciones)
+    ventas = {
+        r["venta_id"] for r in conn.execute(
+            "SELECT venta_id FROM venta_items WHERE id IN (%s)" % ",".join("?" * len(selecciones)),
+            [s[0] for s in selecciones]
+        ).fetchall()
+    }
+    if len(ventas) != 1:
+        raise ValueError("Todos los productos deben pertenecer a la misma venta/cuenta.")
+    venta_id = ventas.pop()
+    venta_ini = conn.execute(
+        "SELECT total, pagado, tipo FROM ventas WHERE id = ?", (venta_id,)
+    ).fetchone()
+
+    lineas = [
+        _aplicar_devolucion_en_conn(conn, item_id, cant, motivo, fecha)
+        for item_id, cant in selecciones
+    ]
+    venta_fin = conn.execute(
+        "SELECT total, pagado, tipo FROM ventas WHERE id = ?", (venta_id,)
+    ).fetchone()
+    importe = round(sum(l["importe"] for l in lineas), 2)
+    salida_auto = round(sum(l["salida"] for l in lineas), 2)
+    salida = salida_auto
+    reembolso_max = salida_auto
+
+    if venta_ini["tipo"] != "contado":
+        # Crédito libre: lo abonado que NO respalda productos liquidados
+        # explícitamente (con su propio movimiento de liquidación).
+        factor = _factor_desc_conn(conn, venta_id)
+        explicito = round(sum(
+            float(r["subtotal"]) * (1.0 if int(r["sin_descuento"] or 0) else factor)
+            for r in conn.execute("""
+                SELECT vi.subtotal, vi.sin_descuento FROM venta_items vi
+                WHERE vi.venta_id = ? AND vi.liquidado = 1
+                  AND NOT EXISTS (SELECT 1 FROM devoluciones d WHERE d.item_id = vi.id)
+                  AND EXISTS (SELECT 1 FROM abonos a
+                              WHERE a.venta_id = vi.venta_id AND a.tipo = 'liquidacion'
+                                AND (a.item_id = vi.id OR a.nota = vi.nombre_producto))
+            """, (venta_id,)).fetchall()
+        ), 2)
+        libre = max(round(float(venta_fin["pagado"]) - explicito, 2), 0.0)
+        reembolso_max = round(salida_auto + libre, 2)
+
+        if reembolso_deseado is not None:
+            deseado = round(float(reembolso_deseado), 2)
+            if deseado + 0.001 < salida_auto:
+                raise ValueError(
+                    f"El reembolso no puede ser menor a ${salida_auto:.2f} "
+                    "(es lo abonado que excede el nuevo total de la cuenta)."
+                )
+            if deseado > reembolso_max + 0.001:
+                raise ValueError(
+                    f"El reembolso máximo posible es ${reembolso_max:.2f}: "
+                    "el resto respalda productos ya liquidados que siguen en la cuenta."
+                )
+            extra = round(deseado - salida_auto, 2)
+            if extra > 0:
+                conn.execute("UPDATE ventas SET pagado = ? WHERE id = ?",
+                             (round(float(venta_fin["pagado"]) - extra, 2), venta_id))
+                lineas[-1]["salida"] = round(lineas[-1]["salida"] + extra, 2)
+                conn.execute(
+                    "UPDATE devoluciones SET salida_dinero = salida_dinero + ? "
+                    "WHERE id = (SELECT MAX(id) FROM devoluciones WHERE venta_id = ?)",
+                    (extra, venta_id))
+                # La cuenta ya no está saldada: los productos que solo se habían
+                # marcado como liquidados por estar saldada vuelven a pendientes.
+                conn.execute("""
+                    UPDATE venta_items SET liquidado = 0
+                    WHERE venta_id = ? AND liquidado = 1
+                      AND NOT EXISTS (SELECT 1 FROM abonos a
+                                      WHERE a.venta_id = venta_items.venta_id
+                                        AND a.tipo = 'liquidacion'
+                                        AND (a.item_id = venta_items.id
+                                             OR a.nota = venta_items.nombre_producto))
+                """, (venta_id,))
+                salida = deseado
+                venta_fin = conn.execute(
+                    "SELECT total, pagado, tipo FROM ventas WHERE id = ?", (venta_id,)
+                ).fetchone()
+    return {
+        "venta_id": venta_id,
+        "tipo_venta": venta_ini["tipo"],
+        "lineas": lineas,
+        "piezas": sum(l["cantidad"] for l in lineas),
+        "importe": importe,                       # baja del total de la cuenta
+        "salida_dinero": salida,                  # dinero que sale de caja
+        "salida_automatica": salida_auto,         # mínimo que corresponde por regla
+        "reembolso_max": reembolso_max,           # tope que el cajero puede entregar
+        "total_antes": float(venta_ini["total"]), "pagado_antes": float(venta_ini["pagado"]),
+        "nuevo_total": float(venta_fin["total"]), "nuevo_pagado": float(venta_fin["pagado"]),
+        "saldo_pendiente": max(round(float(venta_fin["total"]) - float(venta_fin["pagado"]), 2), 0.0),
+    }
+
+
+def simular_devolucion(selecciones, reembolso_deseado=None):
+    """Calcula el efecto de una devolución SIN guardar nada (vista previa).
+
+    Ejecuta la misma lógica que la devolución real dentro de una transacción
+    que siempre se revierte, así la vista previa nunca difiere del resultado.
+    """
+    conn = get_connection()
+    try:
+        res = _devolver_lote_en_conn(
+            conn, selecciones, "simulación", datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            reembolso_deseado
+        )
+        return res
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def registrar_devolucion_multiple(selecciones, motivo, fecha=None, reembolso_deseado=None):
+    """Registra la devolución de VARIOS productos de una misma venta en una sola operación.
+
+    selecciones: lista de (item_id, cantidad).
+
+    - Contado: el importe de lo devuelto sale de caja.
+    - Crédito/abono: se devuelve al cliente solo lo abonado que excede el nuevo
+      total de la cuenta. Los abonos son de la cuenta, no de un producto
+      específico, por eso se calcula sobre el conjunto devuelto y no producto
+      por producto. Si se devuelve toda la cuenta, se reembolsa todo lo abonado.
+    - reembolso_deseado (opcional, solo crédito): entrega más dinero del mínimo
+      automático, hasta el crédito libre de la cuenta (ver _devolver_lote_en_conn).
+    - El reembolso queda como UN solo movimiento negativo en abonos (así el
+      cierre del día refleja la salida de caja en la fecha real de la devolución).
+    """
+    motivo = (motivo or "").strip()
+    if not motivo:
+        raise ValueError("Escribe el motivo de la devolución.")
+    fecha = fecha or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = get_connection()
+    try:
+        res = _devolver_lote_en_conn(conn, selecciones, motivo, fecha, reembolso_deseado)
+        if res["tipo_venta"] == "abono" and res["salida_dinero"] > 0:
+            conn.execute("""
+                INSERT INTO abonos (venta_id, monto, fecha, nota, tipo, metodo_pago)
+                VALUES (?, ?, ?, ?, 'devolucion', 'efectivo')
+            """, (res["venta_id"], -res["salida_dinero"], fecha, f"Devolución: {motivo}"))
+        conn.commit()
+        return res
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def registrar_devolucion(item_id, cantidad, motivo):
+    """Devolución de un solo producto (se conserva por compatibilidad)."""
+    return registrar_devolucion_multiple([(item_id, cantidad)], motivo)
+
+
+def items_devolubles(venta_id):
+    """Productos de la venta con unidades aún devolvibles y su valor NETO unitario.
+
+    El valor neto ya incluye el descuento general de la cuenta, que es lo que
+    realmente bajaría del total al devolver cada pieza.
+    """
+    conn = get_connection()
+    try:
+        factor = _factor_desc_conn(conn, venta_id)
+        rows = conn.execute("""
+            SELECT vi.*,
+                   COALESCE((SELECT SUM(d.cantidad) FROM devoluciones d
+                             WHERE d.item_id = vi.id), 0) AS cantidad_devuelta
+            FROM venta_items vi WHERE vi.venta_id = ? ORDER BY vi.id ASC
+        """, (venta_id,)).fetchall()
+        out = []
+        for r in rows:
+            r = dict(r)
+            disponible = int(r["cantidad"]) - int(r["cantidad_devuelta"] or 0)
+            if disponible <= 0:
+                continue
+            f = 1.0 if int(r.get("sin_descuento") or 0) else factor
+            neto_unit = round(float(r["subtotal"]) / max(int(r["cantidad"]), 1) * f, 2)
+            r["disponible"] = disponible
+            r["neto_unitario"] = neto_unit
+            out.append(r)
+        return out
+    finally:
+        conn.close()
+
+
+def buscar_ventas_devolucion(texto="", tipo="todas", solo_con_pendientes=True, limite=250):
+    """Ventas/cuentas candidatas a devolución, con cuánto queda por devolver."""
+    where, params = [], []
+    if tipo in ("contado", "abono"):
+        where.append("v.tipo = ?")
+        params.append(tipo)
+    texto = (texto or "").strip()
+    if texto:
+        folio = texto.replace("#", "").strip()
+        if folio.isdigit():
+            where.append("(v.cliente LIKE ? COLLATE NOCASE OR v.id = ?)")
+            params += [f"%{texto}%", int(folio)]
+        else:
+            where.append("v.cliente LIKE ? COLLATE NOCASE")
+            params.append(f"%{texto}%")
+    sql = """
+        SELECT * FROM (
+            SELECT v.id, v.fecha, v.cliente, v.tipo, v.total, v.pagado,
+                   COALESCE((SELECT SUM(vi.cantidad) FROM venta_items vi
+                             WHERE vi.venta_id = v.id), 0)
+                 - COALESCE((SELECT SUM(d.cantidad) FROM devoluciones d
+                             WHERE d.venta_id = v.id), 0) AS piezas_disponibles,
+                   (SELECT COUNT(*) FROM devoluciones d WHERE d.venta_id = v.id) AS n_devoluciones
+            FROM ventas v
+            %s
+        ) %s
+        ORDER BY fecha DESC, id DESC LIMIT ?
+    """ % (("WHERE " + " AND ".join(where)) if where else "",
+           "WHERE piezas_disponibles > 0" if solo_con_pendientes else "")
+    conn = get_connection()
+    try:
+        return [dict(r) for r in conn.execute(sql, params + [int(limite)]).fetchall()]
+    finally:
+        conn.close()
+
+
+def obtener_resumen_venta_devolucion(venta_id):
+    """Datos de cabecera de una venta para la pantalla de devoluciones."""
+    conn = get_connection()
+    try:
+        v = conn.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+        if not v:
+            return None
+        v = dict(v)
+        ab = conn.execute("""
+            SELECT COALESCE(SUM(CASE WHEN monto > 0 THEN monto ELSE 0 END), 0) AS recibido,
+                   COALESCE(SUM(CASE WHEN tipo = 'devolucion' THEN -monto ELSE 0 END), 0) AS reembolsado
+            FROM abonos WHERE venta_id = ?
+        """, (venta_id,)).fetchone()
+        v["abonos_recibidos"] = float(ab["recibido"])
+        v["reembolsado"] = float(ab["reembolsado"])
+        return v
+    finally:
+        conn.close()
+
+
+def listar_devoluciones_filtrado(texto="", fecha_desde=None, fecha_hasta=None, limite=300):
+    """Historial de devoluciones con búsqueda por cliente/producto/folio y rango de fechas."""
+    where, params = [], []
+    texto = (texto or "").strip()
+    if texto:
+        folio = texto.replace("#", "").strip()
+        like = f"%{texto}%"
+        if folio.isdigit():
+            where.append("(v.cliente LIKE ? COLLATE NOCASE OR d.nombre_producto LIKE ? COLLATE NOCASE OR d.venta_id = ?)")
+            params += [like, like, int(folio)]
+        else:
+            where.append("(v.cliente LIKE ? COLLATE NOCASE OR d.nombre_producto LIKE ? COLLATE NOCASE)")
+            params += [like, like]
+    if fecha_desde:
+        where.append("d.fecha >= ?")
+        params.append(f"{fecha_desde} 00:00:00")
+    hasta_excl = _fecha_hasta_exclusiva(fecha_hasta)
+    if hasta_excl:
+        where.append("d.fecha < ?")
+        params.append(f"{hasta_excl} 00:00:00")
+    sql = """
+        SELECT d.*, v.cliente, v.tipo AS tipo_venta FROM devoluciones d
+        JOIN ventas v ON v.id = d.venta_id
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY d.fecha DESC, d.id DESC LIMIT ?"
+    conn = get_connection()
+    try:
+        return [dict(r) for r in conn.execute(sql, params + [int(limite)]).fetchall()]
+    finally:
+        conn.close()
+
+
+def resumen_devoluciones(fecha_desde=None, fecha_hasta=None):
+    """Totales de devoluciones del periodo: piezas, valor devuelto y dinero que salió de caja."""
+    where, params = [], []
+    if fecha_desde:
+        where.append("fecha >= ?")
+        params.append(f"{fecha_desde} 00:00:00")
+    hasta_excl = _fecha_hasta_exclusiva(fecha_hasta)
+    if hasta_excl:
+        where.append("fecha < ?")
+        params.append(f"{hasta_excl} 00:00:00")
+    sql = """
+        SELECT COUNT(*) AS lineas,
+               COALESCE(SUM(cantidad), 0)      AS piezas,
+               COALESCE(SUM(importe), 0)       AS importe,
+               COALESCE(SUM(salida_dinero), 0) AS salida_caja
+        FROM devoluciones
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    conn = get_connection()
+    try:
+        return dict(conn.execute(sql, params).fetchone())
+    finally:
+        conn.close()
 
 
 def ventas_del_dia():
@@ -779,20 +1729,18 @@ def ventas_por_producto_en_mes(anio: int, mes: int) -> list:
     conn = get_connection()
     rows = conn.execute("""
         SELECT
-            p.id              AS producto_id,
-            p.nombre          AS nombre,
-            p.stock           AS stock_actual,
-            COALESCE(SUM(vi.cantidad), 0) AS vendido
+            p.id AS producto_id,
+            p.nombre AS nombre,
+            p.stock AS stock_actual,
+            COALESCE((SELECT SUM(vi.cantidad)
+                      FROM venta_items vi JOIN ventas v ON v.id = vi.venta_id
+                      WHERE vi.producto_id = p.id AND v.fecha LIKE ?), 0)
+              - COALESCE((SELECT SUM(d.cantidad) FROM devoluciones d
+                          WHERE d.producto_id = p.id AND d.fecha LIKE ?), 0) AS vendido
         FROM productos p
-        LEFT JOIN venta_items vi
-            ON vi.producto_id = p.id
-            AND vi.venta_id IN (
-                SELECT id FROM ventas WHERE fecha LIKE ?
-            )
         WHERE p.activo = 1
-        GROUP BY p.id, p.nombre, p.stock
         ORDER BY p.nombre ASC
-    """, (prefijo,)).fetchall()
+    """, (prefijo, prefijo)).fetchall()
     conn.close()
 
     result = []
@@ -812,14 +1760,24 @@ def ventas_por_producto_en_mes(anio: int, mes: int) -> list:
 def resumen_del_dia():
     hoy = datetime.now().strftime("%Y-%m-%d")
     conn = get_connection()
+    manana = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     row = conn.execute("""
         SELECT
             COUNT(*)    AS total_ventas,
             SUM(total)  AS monto_total,
-            SUM(pagado) AS monto_cobrado
+            COALESCE(SUM(CASE WHEN tipo = 'contado' THEN pagado + COALESCE(
+                (SELECT SUM(d.importe) FROM devoluciones d WHERE d.venta_id = ventas.id), 0
+            ) ELSE 0 END), 0)
+              + COALESCE((SELECT SUM(a.monto) FROM abonos a
+                          JOIN ventas va ON va.id = a.venta_id
+                          WHERE va.tipo = 'abono' AND a.fecha >= ? AND a.fecha < ?), 0)
+              - COALESCE((SELECT SUM(d.salida_dinero) FROM devoluciones d
+                          JOIN ventas vd ON vd.id = d.venta_id
+                          WHERE vd.tipo = 'contado' AND d.fecha >= ? AND d.fecha < ?), 0)
+              AS monto_cobrado
         FROM ventas
         WHERE fecha LIKE ?
-    """, (f"{hoy}%",)).fetchone()
+    """, (hoy, manana, hoy, manana, f"{hoy}%")).fetchone()
     conn.close()
     return row
 
@@ -827,6 +1785,8 @@ def resumen_del_dia():
 def editar_venta(venta_id, cliente, total, pagado, tipo, nota, metodo_pago="efectivo"):
     conn = get_connection()
     try:
+        if conn.execute("SELECT 1 FROM devoluciones WHERE venta_id = ? LIMIT 1", (venta_id,)).fetchone():
+            raise ValueError("No se puede editar una venta con devoluciones registradas.")
         pagado = min(pagado, total)
         conn.execute("""
             UPDATE ventas
@@ -866,6 +1826,8 @@ def eliminar_venta(venta_id):
     """
     conn = get_connection()
     try:
+        if conn.execute("SELECT 1 FROM devoluciones WHERE venta_id = ? LIMIT 1", (venta_id,)).fetchone():
+            raise ValueError("Esta venta tiene devoluciones registradas y no se puede eliminar para conservar el historial de caja e inventario.")
         items = conn.execute(
             "SELECT producto_id, cantidad FROM venta_items WHERE venta_id = ?",
             (venta_id,)
@@ -915,7 +1877,13 @@ def marcar_items_liquidados_si_saldada(venta_id, conn):
     ).fetchone()
     if venta and venta["pagado"] >= venta["total"]:
         conn.execute(
-            "UPDATE venta_items SET liquidado = 1 WHERE venta_id = ?",
+            """
+            UPDATE venta_items SET liquidado = 1
+            WHERE venta_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM devoluciones d WHERE d.item_id = venta_items.id
+              )
+            """,
             (venta_id,)
         )
 
@@ -957,7 +1925,7 @@ def obtener_abonos(venta_id):
     """
     conn = get_connection()
     rows = conn.execute("""
-        SELECT * FROM abonos WHERE venta_id = ? ORDER BY fecha DESC
+        SELECT * FROM abonos WHERE venta_id = ? ORDER BY fecha DESC, id DESC
     """, (venta_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -977,6 +1945,9 @@ def editar_abono(abono_id, nuevo_monto, metodo_pago=None):
         if not row:
             return False
         venta_id = row["venta_id"]
+        tipo_row = conn.execute("SELECT tipo FROM abonos WHERE id = ?", (abono_id,)).fetchone()
+        if tipo_row and tipo_row["tipo"] != "abono":
+            raise ValueError("Solo se pueden editar abonos normales.")
 
         if metodo_pago is not None:
             conn.execute(
@@ -1049,6 +2020,9 @@ def eliminar_abono(abono_id):
         ).fetchone()
         if not abono:
             return False
+
+        if (abono["tipo"] or "abono") == "devolucion":
+            raise ValueError("Los reembolsos de devolución no se pueden borrar desde el historial de abonos.")
 
         venta_id = abono["venta_id"]
         tipo     = abono["tipo"] if abono["tipo"] else "abono"
@@ -1145,6 +2119,11 @@ def liquidar_item(item_id, venta_id, subtotal_producto, nombre_producto,
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        if conn.execute(
+            "SELECT 1 FROM devoluciones WHERE item_id = ? LIMIT 1", (item_id,)
+        ).fetchone():
+            raise ValueError("El producto tiene una devolución registrada y no se puede liquidar.")
+
         venta = conn.execute(
             "SELECT total, pagado, subtotal_orig FROM ventas WHERE id = ?", (venta_id,)
         ).fetchone()
@@ -1153,19 +2132,21 @@ def liquidar_item(item_id, venta_id, subtotal_producto, nombre_producto,
         subtotal_orig = venta["subtotal_orig"] or 0
 
         # Factor para ajustar los subtotales YA liquidados (que están en BD sin descuento)
-        if subtotal_orig > 0 and subtotal_orig != total_venta:
-            factor = total_venta / subtotal_orig
-        else:
-            factor = 1.0
+        factor = _factor_desc_conn(conn, venta_id)
 
         # subtotal_producto ya viene ajustado desde abonos.py — NO aplicar factor de nuevo.
         # Solo aplicar factor a los subtotales ya liquidados que viven en BD (precio bruto).
-        ya_liquidado_bruto = conn.execute("""
-            SELECT COALESCE(SUM(subtotal), 0) AS suma
-            FROM venta_items
-            WHERE venta_id = ? AND liquidado = 1
-        """, (venta_id,)).fetchone()["suma"]
-        ya_liquidado = round(ya_liquidado_bruto * factor, 2)
+        ya_liquidado = round(sum(
+            float(r["subtotal"]) * (1.0 if int(r["sin_descuento"] or 0) else factor)
+            for r in conn.execute("""
+                SELECT subtotal, sin_descuento
+                FROM venta_items
+                WHERE venta_id = ? AND liquidado = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM devoluciones d WHERE d.item_id = venta_items.id
+                  )
+            """, (venta_id,)).fetchall()
+        ), 2)
 
         credito_libre = max(pagado_actual - ya_liquidado, 0.0)
         faltante = max(subtotal_producto - credito_libre, 0.0)
@@ -1213,6 +2194,10 @@ def registrar_entrega(item_id, entregado, entregado_a="", fecha_entrega=""):
     """
     conn = get_connection()
     try:
+        if entregado and conn.execute(
+            "SELECT 1 FROM devoluciones WHERE item_id = ? LIMIT 1", (item_id,)
+        ).fetchone():
+            raise ValueError("El producto tiene una devolución registrada y no se puede marcar como entregado.")
         conn.execute("""
             UPDATE venta_items
             SET entregado = ?, entregado_a = ?, fecha_entrega = ?

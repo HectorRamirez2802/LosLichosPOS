@@ -39,16 +39,14 @@ class LiquidarProductoDialog(ctk.CTkToplevel):
         self.on_liquidado = on_liquidado
 
         # Factor para distribuir el descuento general proporcionalmente.
-        subtotal_orig = float(venta.get("subtotal_orig") or 0)
-        total_venta   = float(venta.get("total") or 0)
-        if subtotal_orig > 0 and subtotal_orig != total_venta:
-            self._factor_desc = total_venta / subtotal_orig
-        else:
-            self._factor_desc = 1.0
+        # Los productos agregados después del descuento (sin_descuento) quedan fuera.
+        self._factor_desc = db.factor_descuento_venta(venta, items)
 
         # Crédito libre: pagado - subtotales ya liquidados (ajustados por descuento)
-        ya_liq = sum(it["subtotal"] for it in items if it.get("liquidado"))
-        ya_liq_ajustado = round(ya_liq * self._factor_desc, 2)
+        ya_liq_ajustado = round(sum(
+            db.subtotal_neto_item(it, self._factor_desc) for it in items
+            if it.get("liquidado") and not int(it.get("cantidad_devuelta") or 0)
+        ), 2)
         self.credito_libre = max(venta["pagado"] - ya_liq_ajustado, 0.0)
 
         self.title("Liquidar producto")
@@ -141,14 +139,19 @@ class LiquidarProductoDialog(ctk.CTkToplevel):
         self._tree_liq.tag_configure("cubierto",   foreground=C["green"])
         self._tree_liq.tag_configure("faltante",   foreground=C["red"])
         self._tree_liq.tag_configure("liquidado",  foreground=C["muted"])
+        self._tree_liq.tag_configure("devuelto",   foreground="#ffc2a8", background="#3b2930")
 
         for item in self.items:
             ya_liq = bool(item.get("liquidado"))
-            if ya_liq:
+            devuelta = int(item.get("cantidad_devuelta") or 0) > 0
+            if devuelta:
+                tag = "devuelto"
+                texto_est = "↩ Devuelto · bloqueado"
+            elif ya_liq:
                 tag        = "liquidado"
                 texto_est  = "✔ Liquidado"
             else:
-                subtotal_aj = round(item["subtotal"] * self._factor_desc, 2)
+                subtotal_aj = round(db.subtotal_neto_item(item, self._factor_desc), 2)
                 faltante   = max(subtotal_aj - self.credito_libre, 0.0)
                 texto_est  = "✔ Cubierto" if faltante == 0 else f"Falta: ${faltante:.2f}"
                 tag        = "cubierto" if faltante == 0 else "faltante"
@@ -158,7 +161,7 @@ class LiquidarProductoDialog(ctk.CTkToplevel):
                 iid=str(item["id"]),
                 values=(
                     f"{item['nombre_producto']}  ×{item['cantidad']}",
-                    f"${round(item['subtotal'] * self._factor_desc, 2):.2f}",
+                    f"${round(db.subtotal_neto_item(item, self._factor_desc), 2):.2f}",
                     texto_est,
                 ),
                 tags=(tag,),
@@ -234,6 +237,14 @@ class LiquidarProductoDialog(ctk.CTkToplevel):
             return
         iid  = sel[0]
         item = self._items_map.get(iid)
+        if item and int(item.get("cantidad_devuelta") or 0) > 0:
+            self._tree_liq.selection_remove(iid)
+            self._seleccion_id = None
+            self._lbl_resumen.configure(
+                text="Este producto fue devuelto y está bloqueado.",
+                text_color="#ffc2a8"
+            )
+            return
         if item and item.get("liquidado"):
             # Deseleccionar: no se puede liquidar algo ya liquidado
             self._tree_liq.selection_remove(iid)
@@ -262,7 +273,7 @@ class LiquidarProductoDialog(ctk.CTkToplevel):
         if not item:
             return
 
-        subtotal_aj = round(item["subtotal"] * self._factor_desc, 2)
+        subtotal_aj = round(db.subtotal_neto_item(item, self._factor_desc), 2)
         faltante = max(subtotal_aj - self.credito_libre, 0.0)
 
         if faltante == 0:
@@ -287,13 +298,21 @@ class LiquidarProductoDialog(ctk.CTkToplevel):
         if not item:
             return
 
+        if int(item.get("cantidad_devuelta") or 0) > 0:
+            messagebox.showerror(
+                "Producto devuelto",
+                "Este producto fue devuelto y no se puede liquidar.",
+                parent=self
+            )
+            return
+
         # Bloquear si ya está liquidado (doble selección accidental, etc.)
         if item.get("liquidado"):
             messagebox.showinfo("Ya liquidado", "Este producto ya fue liquidado.", parent=self)
             return
 
-        faltante         = max(item["subtotal"] * self._factor_desc - self.credito_libre, 0.0)
-        credito_aplicado = min(self.credito_libre, round(item["subtotal"] * self._factor_desc, 2))
+        faltante         = max(db.subtotal_neto_item(item, self._factor_desc) - self.credito_libre, 0.0)
+        credito_aplicado = min(self.credito_libre, round(db.subtotal_neto_item(item, self._factor_desc), 2))
 
         if faltante == 0:
             linea_resumen = (
@@ -309,7 +328,7 @@ class LiquidarProductoDialog(ctk.CTkToplevel):
         confirmado = messagebox.askyesno(
             "Confirmar liquidación",
             f"Liquidar «{item['nombre_producto']} ×{item['cantidad']}»\n"
-            f"Subtotal (con descuento): ${round(item['subtotal'] * self._factor_desc, 2):.2f}\n"
+            f"Subtotal (con descuento): ${round(db.subtotal_neto_item(item, self._factor_desc), 2):.2f}\n"
             f"{linea_resumen}\n\n"
             "El producto quedará marcado como liquidado\n"
             "y se registrará en el historial de abonos.",
@@ -320,7 +339,7 @@ class LiquidarProductoDialog(ctk.CTkToplevel):
 
         cant = item.get("cantidad", 1)
         nota_liq = f"{item['nombre_producto']} x{cant}" if cant > 1 else item["nombre_producto"]
-        subtotal_aj = round(item["subtotal"] * self._factor_desc, 2)
+        subtotal_aj = round(db.subtotal_neto_item(item, self._factor_desc), 2)
         # db.liquidar_item siempre registra en historial (monto=0 si cubierto por crédito)
         db.liquidar_item(item["id"], self.venta["id"], subtotal_aj,
                          nota_liq, self.metodo_var.get())
@@ -452,7 +471,11 @@ class EntregaDialog(ctk.CTkToplevel):
             messagebox.showerror("Error", "Indica a quién se entregó el producto.", parent=self)
             return
 
-        db.registrar_entrega(self.item["id"], entregado, nombre, fecha)
+        try:
+            db.registrar_entrega(self.item["id"], entregado, nombre, fecha)
+        except Exception as e:
+            messagebox.showerror("No se puede registrar la entrega", str(e), parent=self)
+            return
         self.on_guardado()
         self.destroy()
 
@@ -988,6 +1011,12 @@ class DetalleCuenta(ctk.CTkToplevel):
             text_color=C["accent"], font=ctk.CTkFont(size=11, weight="bold"),
             corner_radius=6, command=self._abrir_agregar_producto
         ).pack(side="right")
+        ctk.CTkButton(
+            seccion_prod, text="↩ Devolver / cancelar", height=26,
+            fg_color="#33281a", hover_color="#48381f",
+            text_color=C["yellow"], font=ctk.CTkFont(size=11, weight="bold"),
+            corner_radius=6, command=self._abrir_devolucion
+        ).pack(side="right", padx=(0, 6))
 
         self._items_frame_container = ctk.CTkFrame(p, fg_color="transparent")
         self._items_frame_container.pack(fill="x", padx=28)
@@ -1178,6 +1207,7 @@ class DetalleCuenta(ctk.CTkToplevel):
         tree.tag_configure("row_odd",      background=C["surface2"])
         tree.tag_configure("liq_even",     background=C["surface"],  foreground=C["muted"])
         tree.tag_configure("liq_odd",      background=C["surface2"], foreground=C["muted"])
+        tree.tag_configure("devuelto",      background="#3b2930", foreground="#ffc2a8")
 
         # Guardar items para doble-clic
         self._items_data = {}
@@ -1186,7 +1216,7 @@ class DetalleCuenta(ctk.CTkToplevel):
         _subtotal_orig = float(self.venta.get("subtotal_orig") or 0)
         _total_venta   = float(self.venta.get("total") or 0)
         _tiene_desc    = _subtotal_orig > 0 and abs(_subtotal_orig - _total_venta) > 0.001
-        _factor        = (_total_venta / _subtotal_orig) if _tiene_desc else 1.0
+        _factor        = db.factor_descuento_venta(self.venta, items)
 
         # Encabezado de subtotal con viñeta si aplica descuento
         if _tiene_desc:
@@ -1200,10 +1230,11 @@ class DetalleCuenta(ctk.CTkToplevel):
 
             # Precio unitario ajustado por descuento general
             p_unit_base = float(item.get("precio_ajustado") or item.get("precio_unitario", 0))
-            p_unit = round(p_unit_base * _factor, 2)
+            _f_item = 1.0 if int(item.get("sin_descuento") or 0) else _factor
+            p_unit = round(p_unit_base * _f_item, 2)
 
             # Subtotal ajustado por descuento general
-            subtotal_aj = round(float(item["subtotal"]) * _factor, 2)
+            subtotal_aj = round(float(item["subtotal"]) * _f_item, 2)
 
             pago_txt    = "\u2714 Liquidado" if liq  else "\u23f3 Pendiente"
             entrega_txt = ""
@@ -1214,13 +1245,21 @@ class DetalleCuenta(ctk.CTkToplevel):
                 entrega_txt = "Sin entregar"
 
             nota_txt = "\U0001f4dd S\u00ed" if nota else "\u2014"
+            cantidad = int(item.get("cantidad") or 0)
+            devuelta = int(item.get("cantidad_devuelta") or 0)
+            cantidad_txt = f"×{cantidad} (dev. {devuelta})" if devuelta else f"×{cantidad}"
 
-            tag = ("liq_even" if par else "liq_odd") if liq else ("row_even" if par else "row_odd")
+            if devuelta:
+                pago_txt = "↩ Devuelto · bloqueado"
+                entrega_txt = "No disponible"
+                tag = "devuelto"
+            else:
+                tag = ("liq_even" if par else "liq_odd") if liq else ("row_even" if par else "row_odd")
 
             iid = tree.insert("", "end",
                 values=(
                     item["nombre_producto"],
-                    f"\u00d7{item['cantidad']}",
+                    cantidad_txt,
                     f"${p_unit:.2f}",
                     f"${subtotal_aj:.2f}",
                     pago_txt,
@@ -1264,16 +1303,30 @@ class DetalleCuenta(ctk.CTkToplevel):
         # ── Nota al pie ───────────────────────────────────────────────────────
         ctk.CTkLabel(
             wrapper,
-            text="Doble clic: registrar/editar entrega   ·   Clic derecho: quitar producto",
+            text="Doble clic: registrar/editar entrega   ·   Clic derecho: quitar producto (requiere autorización)",
             font=ctk.CTkFont(size=10),
             text_color=C["muted"]
         ).pack(anchor="e", padx=10, pady=(0, 6))
 
     def _abrir_entrega(self, item):
+        if int(item.get("cantidad_devuelta") or 0) > 0:
+            messagebox.showerror(
+                "Producto devuelto",
+                "Este producto fue devuelto y no se puede marcar como entregado.",
+                parent=self
+            )
+            return
         EntregaDialog(self, item=item, on_guardado=self._refresh)
 
     # ── Quitar un producto de la cuenta (p.ej. se agregó por error) ──────────
     def _quitar_item(self, item):
+        if int(item.get("cantidad_devuelta") or 0) > 0:
+            messagebox.showerror(
+                "Producto devuelto",
+                "Este producto ya tiene una devolución registrada y no se puede quitar de la cuenta.",
+                parent=self
+            )
+            return
         if item.get("liquidado"):
             messagebox.showerror(
                 "No se puede quitar",
@@ -1300,13 +1353,16 @@ class DetalleCuenta(ctk.CTkToplevel):
         if not confirmar:
             return
 
-        try:
-            db.eliminar_item_venta(item["id"])
-        except Exception as e:
-            messagebox.showerror("Error", str(e), parent=self)
-            return
+        def _eliminar_autorizado():
+            try:
+                db.eliminar_item_venta(item["id"])
+            except Exception as e:
+                messagebox.showerror("Error", str(e), parent=self)
+                return
+            self._refresh()
 
-        self._refresh()
+        from views.devoluciones import AutenticacionDialog
+        AutenticacionDialog(self, _eliminar_autorizado, "Autorizar quitar producto")
 
 
 
@@ -1328,7 +1384,7 @@ class DetalleCuenta(ctk.CTkToplevel):
         # Reconstruir el histórico acumulado para mostrar saldo tras cada abono
         total = self.venta["total"]
         # Ordenar por fecha ascendente para calcular acumulado
-        abonos_asc = sorted(abonos, key=lambda a: a["fecha"])
+        abonos_asc = sorted(abonos, key=lambda a: (a["fecha"], a["id"]))
         acumulado  = 0.0
         saldo_post = {}   # abono_id -> saldo_restante después de ese abono
         for ab in abonos_asc:
@@ -1370,6 +1426,14 @@ class DetalleCuenta(ctk.CTkToplevel):
                     font=ctk.CTkFont(size=10, weight="bold"),
                     text_color=C["yellow"], fg_color="#3a2a00"
                 ).pack(padx=6, pady=2)
+            elif tipo == "devolucion":
+                badge = ctk.CTkFrame(left, fg_color="#3a2020", corner_radius=4)
+                badge.pack(anchor="w", pady=(4, 0))
+                ctk.CTkLabel(
+                    badge, text=ab.get("nota") or "Devolución / reembolso",
+                    font=ctk.CTkFont(size=10, weight="bold"),
+                    text_color=C["red"], fg_color="#3a2020", wraplength=260
+                ).pack(padx=6, pady=2)
             elif ab.get("nota"):
                 ctk.CTkLabel(
                     left, text=ab["nota"],
@@ -1400,11 +1464,12 @@ class DetalleCuenta(ctk.CTkToplevel):
                     text_color=C["green"], fg_color=bg
                 ).pack(anchor="w")
             else:
+                es_reembolso = tipo == "devolucion"
                 ctk.CTkLabel(
                     center,
-                    text=f"+${ab['monto']:.2f}",
+                    text=(f"−${abs(ab['monto']):.2f}" if es_reembolso else f"+${ab['monto']:.2f}"),
                     font=ctk.CTkFont(size=15, weight="bold"),
-                    text_color=C["green"], fg_color=bg
+                    text_color=C["red"] if es_reembolso else C["green"], fg_color=bg
                 ).pack(anchor="w")
 
             # Línea de desglose: antes → después
@@ -1435,7 +1500,7 @@ class DetalleCuenta(ctk.CTkToplevel):
             btn_frame.grid(row=0, column=2, padx=(4, 12), pady=8, sticky="e")
 
             # Ticket: aplica a abonos normales y a liquidaciones con cobro real (monto > 0)
-            if tipo != "liquidacion" or float(ab["monto"]) > 0:
+            if tipo not in ("liquidacion", "devolucion") or float(ab["monto"]) > 0:
                 ctk.CTkButton(
                     btn_frame, text="🖨", width=32, height=28,
                     fg_color=C["surface2"], hover_color=C["border"],
@@ -1445,7 +1510,7 @@ class DetalleCuenta(ctk.CTkToplevel):
                 ).pack(side="left", padx=(0, 4))
 
             # No se puede editar un abono de liquidación
-            if tipo != "liquidacion":
+            if tipo == "abono":
                 ctk.CTkButton(
                     btn_frame, text="✏", width=32, height=28,
                     fg_color=C["surface2"], hover_color=C["border"],
@@ -1454,13 +1519,14 @@ class DetalleCuenta(ctk.CTkToplevel):
                     command=lambda a=dict(ab): self._editar_abono(a)
                 ).pack(side="left", padx=(0, 4))
 
-            ctk.CTkButton(
-                btn_frame, text="✕", width=32, height=28,
-                fg_color="#2a1520", hover_color="#3d1f2a",
-                text_color=C["red"], font=ctk.CTkFont(size=14),
-                corner_radius=6,
-                command=lambda a=dict(ab): self._eliminar_abono(a)
-            ).pack(side="left")
+            if tipo != "devolucion":
+                ctk.CTkButton(
+                    btn_frame, text="✕", width=32, height=28,
+                    fg_color="#2a1520", hover_color="#3d1f2a",
+                    text_color=C["red"], font=ctk.CTkFont(size=14),
+                    corner_radius=6,
+                    command=lambda a=dict(ab): self._eliminar_abono(a)
+                ).pack(side="left")
 
     # ── Imprimir ticket de abono ──────────────────────────────────────────────
     def _imprimir_ticket_abono(self, abono: dict):
@@ -1546,6 +1612,13 @@ class DetalleCuenta(ctk.CTkToplevel):
         self.on_abono()
 
     # ── Abrir diálogo de agregar producto a la cuenta ─────────────────────────
+    def _abrir_devolucion(self):
+        """Cierra el detalle y abre la pestaña Devoluciones con esta cuenta elegida."""
+        app = self.master.winfo_toplevel()
+        venta_id = self.venta_id
+        self.destroy()
+        app.ir_a_devoluciones(venta_id)
+
     def _abrir_agregar_producto(self):
         AgregarProductoDialog(
             parent       = self,
@@ -1579,6 +1652,13 @@ class DetalleCuenta(ctk.CTkToplevel):
 
     # ── Eliminar abono ────────────────────────────────────────────────────────
     def _eliminar_abono(self, abono):
+        if abono.get("tipo") == "devolucion":
+            messagebox.showerror(
+                "Movimiento protegido",
+                "El reembolso forma parte del registro de devolución y no se elimina desde aquí.",
+                parent=self,
+            )
+            return
         fecha = abono["fecha"][:16].replace("T", " ")
         tipo  = abono.get("tipo", "abono")
         extra = ""
@@ -1826,6 +1906,32 @@ class AbonosView(ctk.CTkFrame):
     """
     PAGE_SIZE = 200
 
+    # Orden de la tabla: etiqueta -> cláusula ORDER BY (SQLite).
+    # En "ultimo_abono": las cuentas que nunca han abonado (NULL) van al final
+    # al ordenar "más reciente" y al principio al ordenar "más antiguo".
+    ORDEN_DEFECTO = "Venta más reciente"
+    ORDENES = {
+        "Venta más reciente":          "v.fecha DESC, v.id DESC",
+        "Venta más antigua":           "v.fecha ASC, v.id ASC",
+        "Quien debe más":              "restante DESC, v.fecha DESC",
+        "Quien debe menos":            "restante ASC, v.fecha DESC",
+        "Último abono: más reciente":  "(ua.ultimo_abono IS NULL), ua.ultimo_abono DESC, v.fecha DESC",
+        "Último abono: más antiguo":   "(ua.ultimo_abono IS NOT NULL), ua.ultimo_abono ASC, v.fecha ASC",
+        "Cliente (A-Z)":               "LOWER(v.cliente) ASC, v.fecha DESC",
+    }
+
+    # Filtro por último abono: etiqueta -> (condición SQL, parámetros).
+    # "Sin abonar hace +N días" toma como referencia el último abono o, si la
+    # cuenta nunca ha abonado, la fecha de la venta.
+    FILTRO_ABONO_DEFECTO = "Todos"
+    FILTROS_ABONO = {
+        "Todos":                     None,
+        "Sin abonos aún":            "ua.ultimo_abono IS NULL",
+        "Sin abonar hace +15 días":  15,
+        "Sin abonar hace +30 días":  30,
+        "Sin abonar hace +60 días":  60,
+    }
+
     def __init__(self, parent, app):
         super().__init__(parent, fg_color="transparent")
         self.app = app
@@ -1919,6 +2025,37 @@ class AbonosView(ctk.CTkFrame):
             command=self._abrir_detalle_seleccionado
         ).grid(row=0, column=4)
 
+        # ── Fila 2: ordenar y filtrar por último abono ───────────────────
+        fila2 = ctk.CTkFrame(frame, fg_color="transparent")
+        fila2.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+
+        ctk.CTkLabel(
+            fila2, text="Ordenar por:", font=ctk.CTkFont(size=12),
+            text_color=C["muted"]
+        ).pack(side="left", padx=(2, 6))
+        self.orden_var = ctk.StringVar(value=self.ORDEN_DEFECTO)
+        ctk.CTkOptionMenu(
+            fila2, variable=self.orden_var, values=list(self.ORDENES.keys()),
+            width=230, height=32, fg_color=C["surface"],
+            button_color=C["surface2"], button_hover_color=C["border"],
+            text_color=C["text"], font=ctk.CTkFont(size=12),
+            command=lambda _v: self.cargar_cuentas(reset_pagina=True)
+        ).pack(side="left", padx=(0, 18))
+
+        ctk.CTkLabel(
+            fila2, text="Último abono:", font=ctk.CTkFont(size=12),
+            text_color=C["muted"]
+        ).pack(side="left", padx=(0, 6))
+        self.filtro_abono_var = ctk.StringVar(value=self.FILTRO_ABONO_DEFECTO)
+        ctk.CTkOptionMenu(
+            fila2, variable=self.filtro_abono_var,
+            values=list(self.FILTROS_ABONO.keys()),
+            width=230, height=32, fg_color=C["surface"],
+            button_color=C["surface2"], button_hover_color=C["border"],
+            text_color=C["text"], font=ctk.CTkFont(size=12),
+            command=lambda _v: self.cargar_cuentas(reset_pagina=True)
+        ).pack(side="left")
+
     def _set_filtro(self, valor):
         self.filtro_var.set(valor)
         _active   = {"fg_color": C["accent"],   "text_color": "#fff",      "font": ctk.CTkFont(size=13, weight="bold")}
@@ -1963,7 +2100,7 @@ class AbonosView(ctk.CTkFrame):
         cont.grid_rowconfigure(0, weight=1)
         cont.grid_columnconfigure(0, weight=1)
 
-        columnas = ("cliente", "telefono", "fecha", "total", "pagado", "restante", "descuento", "metodo", "estado")
+        columnas = ("cliente", "telefono", "fecha", "ultimo_abono", "total", "pagado", "restante", "descuento", "metodo", "estado")
         self.tabla = ttk.Treeview(
             cont, columns=columnas, show="headings", selectmode="browse",
             style="Lichos.Treeview"
@@ -1976,12 +2113,13 @@ class AbonosView(ctk.CTkFrame):
         self.tabla.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
         headers = {
-            "cliente": "Cliente", "telefono": "Tel\u00e9fono", "fecha": "Fecha", "total": "Total",
+            "cliente": "Cliente", "telefono": "Tel\u00e9fono", "fecha": "Fecha venta",
+            "ultimo_abono": "\u00daltimo abono", "total": "Total",
             "pagado": "Pagado", "restante": "Pendiente", "descuento": "Desc.",
             "metodo": "M\u00e9todo", "estado": "Estado",
         }
-        widths = {"cliente": 180, "telefono": 110, "fecha": 135, "total": 95, "pagado": 95, "restante": 105, "descuento": 90, "metodo": 125, "estado": 110}
-        anchors = {"cliente": "w", "telefono": "center", "fecha": "center", "total": "e", "pagado": "e", "restante": "e", "descuento": "center", "metodo": "center", "estado": "center"}
+        widths = {"cliente": 180, "telefono": 110, "fecha": 135, "ultimo_abono": 135, "total": 95, "pagado": 95, "restante": 105, "descuento": 90, "metodo": 125, "estado": 110}
+        anchors = {"cliente": "w", "telefono": "center", "fecha": "center", "ultimo_abono": "center", "total": "e", "pagado": "e", "restante": "e", "descuento": "center", "metodo": "center", "estado": "center"}
         for col in columnas:
             self.tabla.heading(col, text=headers[col], anchor="w")
             self.tabla.column(col, width=widths[col], minwidth=70, anchor=anchors[col], stretch=(col == "cliente"))
@@ -2050,6 +2188,7 @@ class AbonosView(ctk.CTkFrame):
         self.tabla_items.tag_configure("odd", background=C["surface2"])
         self.tabla_items.tag_configure("liq", foreground=C["green"])
         self.tabla_items.tag_configure("pend", foreground=C["yellow"])
+        self.tabla_items.tag_configure("dev", foreground="#ffc2a8")
 
     # ── CARGA DE DATOS ──────────────────────────────────────────────────────
     def _programar_cargar_cuentas(self, _event=None):
@@ -2060,27 +2199,52 @@ class AbonosView(ctk.CTkFrame):
                 pass
         self._cuentas_after_id = self.after(180, lambda: self.cargar_cuentas(reset_pagina=True))
 
-    def _query_cuentas(self, texto, filtro, limite, offset):
+    def _query_cuentas(self, texto, filtro, limite, offset, orden=None, filtro_abono=None):
         texto = (texto or "").strip().lower()
-        where = ["tipo = 'abono'"]
+        where = ["v.tipo = 'abono'"]
         params = []
         if texto:
-            where.append("LOWER(cliente) LIKE ?")
+            where.append("LOWER(v.cliente) LIKE ?")
             params.append(f"%{texto}%")
         if filtro == "pendientes":
-            where.append("pagado < total")
+            where.append("v.pagado < v.total")
         elif filtro == "saldadas":
-            where.append("pagado >= total")
+            where.append("v.pagado >= v.total")
+
+        # Filtro por último abono
+        cond = self.FILTROS_ABONO.get(filtro_abono or self.FILTRO_ABONO_DEFECTO)
+        if isinstance(cond, int):
+            where.append(
+                "date(COALESCE(ua.ultimo_abono, v.fecha)) <= date('now', 'localtime', ?)"
+            )
+            params.append(f"-{cond} days")
+        elif cond:
+            where.append(cond)
         where_sql = " AND ".join(where)
+
+        order_sql = self.ORDENES.get(orden or self.ORDEN_DEFECTO, self.ORDENES[self.ORDEN_DEFECTO])
+
+        # Último abono = último pago real (abonos y liquidaciones con monto > 0).
+        # Se excluyen los reembolsos de devolución (monto negativo) y las
+        # liquidaciones cubiertas con crédito (monto 0).
+        from_sql = """
+            FROM ventas v
+            LEFT JOIN (
+                SELECT venta_id, MAX(fecha) AS ultimo_abono
+                FROM abonos
+                WHERE tipo IN ('abono', 'liquidacion') AND monto > 0
+                GROUP BY venta_id
+            ) ua ON ua.venta_id = v.id
+        """
 
         conn = db.get_connection()
         try:
-            total = conn.execute(f"SELECT COUNT(*) AS n FROM ventas WHERE {where_sql}", params).fetchone()["n"]
+            total = conn.execute(f"SELECT COUNT(*) AS n {from_sql} WHERE {where_sql}", params).fetchone()["n"]
             rows = conn.execute(f"""
-                SELECT *, (total - pagado) AS restante
-                FROM ventas
+                SELECT v.*, (v.total - v.pagado) AS restante, ua.ultimo_abono
+                {from_sql}
                 WHERE {where_sql}
-                ORDER BY fecha DESC
+                ORDER BY {order_sql}
                 LIMIT ? OFFSET ?
             """, params + [int(limite), int(offset)]).fetchall()
         finally:
@@ -2104,10 +2268,14 @@ class AbonosView(ctk.CTkFrame):
         selected = self.tabla.selection()[0] if self.tabla.selection() else None
         texto  = self.buscador.get().strip()
         filtro = self.filtro_var.get()
-        total, cuentas = self._query_cuentas(texto, filtro, self.PAGE_SIZE, self._pagina * self.PAGE_SIZE)
+        orden        = self.orden_var.get()
+        filtro_abono = self.filtro_abono_var.get()
+        total, cuentas = self._query_cuentas(
+            texto, filtro, self.PAGE_SIZE, self._pagina * self.PAGE_SIZE, orden, filtro_abono)
         if self._pagina * self.PAGE_SIZE >= total and self._pagina > 0:
             self._pagina = max(0, (max(total, 1) - 1) // self.PAGE_SIZE)
-            total, cuentas = self._query_cuentas(texto, filtro, self.PAGE_SIZE, self._pagina * self.PAGE_SIZE)
+            total, cuentas = self._query_cuentas(
+                texto, filtro, self.PAGE_SIZE, self._pagina * self.PAGE_SIZE, orden, filtro_abono)
 
         self._total_resultados = total
         self._cuentas_by_id = {}
@@ -2137,6 +2305,7 @@ class AbonosView(ctk.CTkFrame):
                     venta.get("cliente", "Mostrador"),
                     venta.get("telefono") or "—",
                     str(venta.get("fecha", ""))[:16].replace("T", " "),
+                    str(venta.get("ultimo_abono") or "")[:16].replace("T", " ") or "—",
                     f"${float(venta.get('total') or 0):.2f}",
                     f"${float(venta.get('pagado') or 0):.2f}",
                     "✔ Saldada" if saldada else f"${restante:.2f}",
@@ -2201,27 +2370,35 @@ class AbonosView(ctk.CTkFrame):
         _subtotal_orig = float(venta.get("subtotal_orig") or 0)
         _total_venta   = float(venta.get("total") or 0)
         _tiene_desc    = _subtotal_orig > 0 and abs(_subtotal_orig - _total_venta) > 0.001
-        _factor        = (_total_venta / _subtotal_orig) if _tiene_desc else 1.0
 
         # Encabezado dinámico con viñeta si hay descuento
         self.tabla_items.heading("subtotal", text=("Subtotal 🏷️" if _tiene_desc else "Subtotal"), anchor="w")
 
         items = db.obtener_items_venta(venta["id"])
+        _factor = db.factor_descuento_venta(venta, items)
         for i, item in enumerate(items):
             it = dict(item)
             liq = bool(it.get("liquidado"))
-            subtotal_aj = round(float(it.get("subtotal") or 0) * _factor, 2)
+            devuelto = int(it.get("cantidad_devuelta") or 0) > 0
+            _f_item = 1.0 if int(it.get("sin_descuento") or 0) else _factor
+            subtotal_aj = round(float(it.get("subtotal") or 0) * _f_item, 2)
+            if devuelto:
+                estado_txt, tag_estado = "↩ Devuelto", "dev"
+            elif liq:
+                estado_txt, tag_estado = "✔ Liquidado", "liq"
+            else:
+                estado_txt, tag_estado = "Pendiente", "pend"
             self.tabla_items.insert(
                 "", "end",
                 values=(
                     it.get("nombre_producto", ""),
-                    f"${round(float(it.get('precio_unitario') or 0) * _factor, 2):.2f}",
+                    f"${round(float(it.get('precio_unitario') or 0) * _f_item, 2):.2f}",
                     str(it.get("cantidad") or 0),
                     f"${subtotal_aj:.2f}",
-                    "✔ Liquidado" if liq else "Pendiente",
+                    estado_txt,
                     it.get("nota_item") or "N/A",
                 ),
-                tags=("even" if i % 2 == 0 else "odd", "liq" if liq else "pend")
+                tags=("even" if i % 2 == 0 else "odd", tag_estado)
             )
 
     def _venta_seleccionada_silenciosa(self):

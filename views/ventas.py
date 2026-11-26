@@ -463,19 +463,109 @@ class VentasView(ctk.CTkFrame):
             command=self._reimprimir_sel
         ).pack(side="left", padx=(0, 6))
 
-        ctk.CTkButton(
-            botones, text="✏ Editar", width=88, height=32,
-            fg_color="#1e2a1e", hover_color="#2a3f2a",
-            text_color=C["green"], font=ctk.CTkFont(size=12),
-            command=self._editar_sel
-        ).pack(side="left", padx=(0, 6))
+        # Se guardan referencias (y sus colores originales) para poder bloquear
+        # estas acciones cuando la venta seleccionada tiene devoluciones.
+        self._btns_accion = {}
 
-        ctk.CTkButton(
-            botones, text="🗑 Eliminar", width=94, height=32,
+        def _boton_accion(clave, **kw):
+            btn = ctk.CTkButton(botones, height=32, font=ctk.CTkFont(size=12),
+                                text_color_disabled=C["border"], **kw)
+            self._btns_accion[clave] = (btn, {
+                "fg_color": kw["fg_color"], "hover_color": kw["hover_color"],
+                "text_color": kw["text_color"],
+            })
+            return btn
+
+        # Abre el diálogo de la cuenta (pestaña Abonos): desde ahí se editan o
+        # eliminan los abonos. Solo aplica a cuentas a crédito.
+        _boton_accion(
+            "cuenta", text="💳 Cuenta", width=96,
+            fg_color=C["surface2"], hover_color=C["border"],
+            text_color=C["accent"], command=self._abrir_cuenta_sel
+        )
+        self._btns_accion["cuenta"][0].pack(side="left", padx=(0, 6))
+
+        _boton_accion(
+            "editar", text="✏ Editar", width=88,
+            fg_color="#1e2a1e", hover_color="#2a3f2a",
+            text_color=C["green"], command=self._editar_sel
+        )
+        self._btns_accion["editar"][0].pack(side="left", padx=(0, 6))
+
+        _boton_accion(
+            "devolver", text="↩ Devolver", width=96,
+            fg_color="#33281a", hover_color="#48381f",
+            text_color=C["yellow"], command=self._devolver_sel
+        )
+        self._btns_accion["devolver"][0].pack(side="left", padx=(0, 6))
+
+        _boton_accion(
+            "eliminar", text="🗑 Eliminar", width=94,
             fg_color="#2a1e1e", hover_color="#3f2a2a",
-            text_color=C["red"], font=ctk.CTkFont(size=12),
-            command=self._eliminar_sel
-        ).pack(side="left")
+            text_color=C["red"], command=self._eliminar_sel
+        )
+        self._btns_accion["eliminar"][0].pack(side="left")
+
+    def _actualizar_acciones(self, venta=None):
+        """Bloquea las opciones que no aplican según las devoluciones de la venta.
+
+        - Con devoluciones (parciales o totales): no se puede Editar ni Eliminar
+          (se conserva el historial de caja e inventario).
+        - Devuelta por completo: tampoco se puede Devolver (ya no queda nada).
+        - Renglón de ABONO (pago a una cuenta): no se edita, elimina ni devuelve
+          desde aquí; se gestiona desde la pestaña Abonos (botón 💳 Cuenta).
+        El Ticket siempre queda disponible.
+        """
+        if not hasattr(self, "_btns_accion"):
+            return
+        es_abono = bool(venta and venta.get("kind") == "abono")
+        tiene = bool(venta and venta.get("tiene_devoluciones"))
+        total = bool(venta and venta.get("devuelta_total"))
+        tiene_cuenta = bool(venta and (es_abono or venta.get("tipo") == "abono"))
+        habilitado = {
+            "editar":   not tiene and not es_abono,
+            "eliminar": not tiene and not es_abono,
+            "devolver": not total and not es_abono,
+            "cuenta":   tiene_cuenta,
+        }
+        for clave, (btn, orig) in self._btns_accion.items():
+            if habilitado[clave]:
+                btn.configure(state="normal", **orig)
+            else:
+                btn.configure(state="disabled", fg_color=C["surface2"],
+                              hover_color=C["surface2"])
+
+    def _venta_bloqueada(self, vid, accion):
+        """True (y avisa) si la acción está bloqueada para la venta `vid`."""
+        row = self._get_selected_row()
+        if row and row.get("kind") == "abono" and accion in ("editar", "eliminar", "devolver"):
+            if messagebox.askyesno(
+                "Abono registrado",
+                f"Este renglón es un abono al folio #{vid}.\n\n"
+                "Los abonos no se editan, eliminan ni devuelven desde el historial: "
+                "se gestionan desde la pestaña Abonos.\n\n"
+                "¿Abrir la cuenta ahora?",
+                parent=self
+            ):
+                self._abrir_cuenta(vid)
+            return True
+        venta = getattr(self, "_ventas_cache", {}).get(self._make_iid("venta", vid), {})
+        if accion in ("editar", "eliminar") and venta.get("tiene_devoluciones"):
+            messagebox.showinfo(
+                "Venta con devoluciones",
+                f"La venta #{vid} tiene devoluciones registradas, por lo que no se "
+                "puede editar ni eliminar (se conserva el historial de caja e inventario).",
+                parent=self
+            )
+            return True
+        if accion == "devolver" and venta.get("devuelta_total"):
+            messagebox.showinfo(
+                "Venta devuelta por completo",
+                f"Todos los productos de la venta #{vid} ya fueron devueltos.",
+                parent=self
+            )
+            return True
+        return False
 
     # ════════════════════════════════════════════════════════════════════════
     #  TABLA DE VENTAS — ttk.Treeview
@@ -512,9 +602,9 @@ class VentasView(ctk.CTkFrame):
             "total":     ("Total",       105, "e"),
             "pagado":    ("Pagado",      105, "e"),
             "descuento": ("Descuento",   105, "center"),
-            "tipo":      ("Tipo",        95,  "center"),
+            "tipo":      ("Tipo",        105, "center"),
             "metodo":    ("Método",      125, "center"),
-            "estado":    ("Estado",      115, "center"),
+            "estado":    ("Estado",      130, "center"),
         }
         for col, (txt, width, anchor) in encabezados.items():
             self.tree.heading(col, text=txt)
@@ -691,15 +781,15 @@ class VentasView(ctk.CTkFrame):
         from datetime import datetime, timedelta
         return (datetime.strptime(fecha, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    def _period_where(self):
+    def _period_where(self, col="fecha"):
         clauses = []
         params = []
         fecha_desde, fecha_hasta = self._fecha_limite()
         if fecha_desde:
-            clauses.append("fecha >= ?")
+            clauses.append(f"{col} >= ?")
             params.append(fecha_desde)
         if fecha_hasta:
-            clauses.append("fecha < ?")
+            clauses.append(f"{col} < ?")
             params.append(self._fecha_siguiente(fecha_hasta))
         return clauses, params
 
@@ -725,57 +815,121 @@ class VentasView(ctk.CTkFrame):
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         return where, params
 
+    # Abonos que se reflejan en el historial como "retomada" del folio:
+    #  • solo pagos reales (monto > 0) de cuentas a crédito: abonos y liquidaciones
+    #  • se omite el "Anticipo inicial": ya forma parte de la propia venta/folio
+    _ABONO_BASE = (
+        "v.tipo = 'abono' AND a.tipo IN ('abono', 'liquidacion') AND a.monto > 0 "
+        "AND NOT (a.tipo = 'abono' AND COALESCE(a.nota, '') = 'Anticipo inicial')"
+    )
+
+    def _where_abonos(self):
+        """(where, params) de los abonos según los filtros activos.
+
+        Devuelve (None, None) si el filtro "Contado" los excluye.
+        """
+        if self.filtro_var.get() == "contado":
+            return None, None
+
+        clauses, params = self._period_where("a.fecha")
+        clauses.insert(0, self._ABONO_BASE)
+
+        texto = self.buscador.get().strip()
+        if texto:
+            texto_like = f"%{texto}%"
+            folio = texto.replace("#", "").strip()
+            if folio.isdigit():
+                clauses.append("(v.cliente LIKE ? COLLATE NOCASE OR v.id = ?)")
+                params.extend([texto_like, int(folio)])
+            else:
+                clauses.append("v.cliente LIKE ? COLLATE NOCASE")
+                params.append(texto_like)
+
+        return " WHERE " + " AND ".join(clauses), params
+
+    @staticmethod
+    def _make_iid(kind, row_id):
+        """Id de fila del Treeview: 'v<folio>' para ventas, 'a<id>' para abonos."""
+        return f"{'a' if kind == 'abono' else 'v'}{int(row_id)}"
+
     def _fetch_ventas(self):
-        where, params = self._where_actual()
+        where_v, params_v = self._where_actual()
+        where_a, params_a = self._where_abonos()
         offset = max(self.page - 1, 0) * self.PAGE_SIZE
 
-        sql_count = f"SELECT COUNT(*) AS c FROM ventas{where}"
-        sql_rows = f"""
+        sql_venta = """
             SELECT
-                id, fecha, cliente, total, pagado, tipo, metodo_pago,
+                'venta' AS kind, id AS row_id, id AS venta_id,
+                fecha, cliente, total, pagado, tipo, metodo_pago,
                 subtotal_orig, descuento_monto, descuento_tipo,
-                descuento_valor, descuento_etiq
+                descuento_valor, descuento_etiq,
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM venta_items vi WHERE vi.venta_id = ventas.id
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM venta_items vi
+                    WHERE vi.venta_id = ventas.id
+                      AND vi.cantidad > COALESCE((
+                          SELECT SUM(d.cantidad) FROM devoluciones d
+                          WHERE d.item_id = vi.id
+                      ), 0)
+                ) THEN 1 ELSE 0 END AS devuelta_total,
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM devoluciones d WHERE d.venta_id = ventas.id
+                ) THEN 1 ELSE 0 END AS tiene_devoluciones,
+                NULL AS abono_monto, NULL AS abono_tipo,
+                NULL AS abono_nota, NULL AS abono_acum
             FROM ventas
-            {where}
-            ORDER BY fecha DESC, id DESC
-            LIMIT ? OFFSET ?
         """
+        # abono_acum = suma de lo abonado hasta este abono (incluido), para
+        # mostrar cuánto resta de la cuenta después de ese pago.
+        sql_abono = """
+            SELECT
+                'abono', a.id, a.venta_id,
+                a.fecha, v.cliente, v.total, v.pagado, v.tipo, a.metodo_pago,
+                v.subtotal_orig, v.descuento_monto, v.descuento_tipo,
+                v.descuento_valor, v.descuento_etiq,
+                0, 0,
+                a.monto, a.tipo, a.nota,
+                (SELECT COALESCE(SUM(a2.monto), 0) FROM abonos a2
+                 WHERE a2.venta_id = a.venta_id
+                   AND (a2.fecha < a.fecha OR (a2.fecha = a.fecha AND a2.id <= a.id)))
+            FROM abonos a
+            JOIN ventas v ON v.id = a.venta_id
+        """
+
+        partes = [sql_venta + where_v]
+        params = list(params_v)
+        if where_a is not None:
+            partes.append(sql_abono + where_a)
+            params.extend(params_a)
+        sql_rows = (
+            " UNION ALL ".join(partes)
+            + " ORDER BY fecha DESC, row_id DESC, kind LIMIT ? OFFSET ?"
+        )
 
         conn = sqlite3.connect(db.DB_PATH)
         conn.row_factory = sqlite3.Row
         try:
-            total = conn.execute(sql_count, params).fetchone()["c"]
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM ventas{where_v}", params_v
+            ).fetchone()["c"]
+            if where_a is not None:
+                total += conn.execute(
+                    "SELECT COUNT(*) AS c FROM abonos a "
+                    f"JOIN ventas v ON v.id = a.venta_id{where_a}", params_a
+                ).fetchone()["c"]
             rows = conn.execute(sql_rows, params + [self.PAGE_SIZE, offset]).fetchall()
             return total, rows
         finally:
             conn.close()
 
     def _actualizar_stats(self):
-        from datetime import datetime, timedelta
+        from datetime import datetime
 
         hoy = datetime.now().strftime("%Y-%m-%d")
-        manana = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        conn = sqlite3.connect(db.DB_PATH)
-        conn.row_factory = sqlite3.Row
-        try:
-            row_hoy = conn.execute(
-                """
-                SELECT COUNT(*) AS c, COALESCE(SUM(pagado), 0) AS s
-                FROM ventas
-                WHERE fecha >= ? AND fecha < ?
-                """,
-                (hoy, manana)
-            ).fetchone()
-
-            pclauses, pparams = self._period_where()
-            pwhere = " WHERE " + " AND ".join(pclauses) if pclauses else ""
-            row_periodo = conn.execute(
-                f"SELECT COUNT(*) AS c, COALESCE(SUM(pagado), 0) AS s FROM ventas{pwhere}",
-                pparams
-            ).fetchone()
-        finally:
-            conn.close()
+        row_hoy = db.resumen_ventas(hoy, hoy)
+        desde, hasta = self._fecha_limite()
+        row_periodo = db.resumen_ventas(desde, hasta)
 
         periodo = self.periodo_var.get()
         if self._fecha_esp_desde:
@@ -787,10 +941,10 @@ class VentasView(ctk.CTkFrame):
             lbl_ingresos = {"hoy": "Ingresos hoy", "semana": "Ingresos semana",
                             "mes": "Ingresos mes", "todo": "Total cobrado"}.get(periodo, "Ingresos")
 
-        self.stat_hoy.configure(text=str(row_hoy["c"]))
-        self.stat_ingresos.configure(text=f"${float(row_hoy['s']):.2f}")
-        self.stat_total.configure(text=str(row_periodo["c"]))
-        self.stat_cobrado.configure(text=f"${float(row_periodo['s']):.2f}")
+        self.stat_hoy.configure(text=str(row_hoy["total_ventas"]))
+        self.stat_ingresos.configure(text=f"${float(row_hoy['monto_cobrado']):.2f}")
+        self.stat_total.configure(text=str(row_periodo["total_ventas"]))
+        self.stat_cobrado.configure(text=f"${float(row_periodo['monto_cobrado']):.2f}")
         self.stat_total_lbl.configure(text=lbl_conteo)
         self.stat_cobrado_lbl.configure(text=lbl_ingresos)
 
@@ -798,7 +952,7 @@ class VentasView(ctk.CTkFrame):
     #  CARGA Y RENDER LIGERO
     # ════════════════════════════════════════════════════════════════════════
     def cargar_ventas(self):
-        venta_seleccionada = self._get_selected_venta_id(default=None)
+        iid_seleccionado = self._get_selected_iid(default=None)
         self._actualizar_stats()
 
         try:
@@ -811,13 +965,28 @@ class VentasView(ctk.CTkFrame):
             self.tree.delete(item)
 
         self._ventas_cache = {}
+        primer_iid = None
         for i, v in enumerate(rows):
-            vid = int(v["id"])
-            iid = str(vid)
-            self._ventas_cache[iid] = dict(v)
-            saldada = float(v["pagado"] or 0) >= float(v["total"] or 0)
-            tag = "even" if i % 2 == 0 else "odd"
-            if not saldada:
+            d = dict(v)
+            iid = self._make_iid(d["kind"], d["row_id"])
+            self._ventas_cache[iid] = d
+            if primer_iid is None:
+                primer_iid = iid
+
+            # Abono: pago a una cuenta a crédito, reflejado como "retomada" del folio
+            if d["kind"] == "abono":
+                self.tree.insert(
+                    "", "end", iid=iid,
+                    values=self._valores_fila_abono(d),
+                    tags=("abono_mov",)
+                )
+                continue
+
+            vid = int(d["venta_id"])
+            saldada = float(d["pagado"] or 0) >= float(d["total"] or 0)
+            devuelta_total = bool(d["devuelta_total"])
+            tag = "devuelta" if devuelta_total else ("even" if i % 2 == 0 else "odd")
+            if not saldada and not devuelta_total:
                 tag = tag + " pendiente"
 
             self.tree.insert(
@@ -826,14 +995,14 @@ class VentasView(ctk.CTkFrame):
                 iid=iid,
                 values=(
                     f"#{vid}",
-                    self._fmt_fecha(v["fecha"]),
-                    v["cliente"] or "Mostrador",
-                    f"${float(v['total'] or 0):.2f}",
-                    f"${float(v['pagado'] or 0):.2f}",
-                    self._fmt_descuento(v),
-                    "Contado" if v["tipo"] == "contado" else "Abono",
-                    self._fmt_metodo(v["metodo_pago"] if "metodo_pago" in v.keys() else "efectivo"),
-                    "Saldada" if saldada else "Pendiente",
+                    self._fmt_fecha(d["fecha"]),
+                    d["cliente"] or "Mostrador",
+                    f"${float(d['total'] or 0):.2f}",
+                    f"${float(d['pagado'] or 0):.2f}",
+                    self._fmt_descuento(d),
+                    "Contado" if d["tipo"] == "contado" else "Abono",
+                    self._fmt_metodo(d["metodo_pago"] if "metodo_pago" in d else "efectivo"),
+                    "Devuelta" if devuelta_total else ("Saldada" if saldada else "Pendiente"),
                 ),
                 tags=tuple(tag.split())
             )
@@ -841,20 +1010,37 @@ class VentasView(ctk.CTkFrame):
         self.tree.tag_configure("even", background=C["surface"])
         self.tree.tag_configure("odd", background=C["surface2"])
         self.tree.tag_configure("pendiente", foreground=C["red"])
+        self.tree.tag_configure("devuelta", background="#3b2930", foreground="#ffc2a8")
+        self.tree.tag_configure("abono_mov", background="#14261e", foreground=C["green"])
 
         self._actualizar_paginacion(len(rows))
 
-        if venta_seleccionada and str(venta_seleccionada) in self._ventas_cache:
-            self.tree.selection_set(str(venta_seleccionada))
-            self.tree.see(str(venta_seleccionada))
-            self._cargar_detalle_venta(venta_seleccionada)
-        elif rows:
-            first = str(rows[0]["id"])
-            self.tree.selection_set(first)
+        seleccion = iid_seleccionado if iid_seleccionado in self._ventas_cache else primer_iid
+        if seleccion:
+            self.tree.selection_set(seleccion)
+            self.tree.see(seleccion)
             self._on_venta_select()
         else:
             self._limpiar_detalle()
+            self._actualizar_acciones(None)
             self.lbl_seleccion.configure(text="No hay ventas que mostrar con los filtros actuales.")
+
+    def _valores_fila_abono(self, d):
+        """Valores de la tabla para un abono (retomada de un folio)."""
+        monto = float(d["abono_monto"] or 0)
+        saldo = max(float(d["total"] or 0) - float(d["abono_acum"] or 0), 0.0)
+        etiqueta = "↳ Liquid." if d["abono_tipo"] == "liquidacion" else "↳ Abono"
+        return (
+            f"↳ #{int(d['venta_id'])}",
+            self._fmt_fecha(d["fecha"]),
+            d["cliente"] or "Mostrador",
+            "—",
+            f"+${monto:.2f}",
+            "—",
+            etiqueta,
+            self._fmt_metodo(d["metodo_pago"]),
+            "Saldó cuenta" if saldo <= 0.005 else f"Resta ${saldo:.2f}",
+        )
 
     def _actualizar_paginacion(self, visibles):
         import math
@@ -909,36 +1095,78 @@ class VentasView(ctk.CTkFrame):
         except Exception:
             return "N/A"
 
-    def _get_selected_venta_id(self, default=None):
+    def _get_selected_iid(self, default=None):
+        """Id de la fila seleccionada en el Treeview ('v<folio>' o 'a<id>')."""
         try:
             sel = self.tree.selection()
-            if not sel:
-                return default
-            return int(sel[0])
+            return sel[0] if sel else default
+        except Exception:
+            return default
+
+    def _get_selected_row(self):
+        """Datos (dict) de la fila seleccionada: venta o abono."""
+        iid = self._get_selected_iid()
+        return self._ventas_cache.get(iid) if iid else None
+
+    def _get_selected_venta_id(self, default=None):
+        """Folio de la fila seleccionada (para un abono, el folio al que pertenece)."""
+        row = self._get_selected_row()
+        if not row:
+            return default
+        try:
+            return int(row["venta_id"])
         except Exception:
             return default
 
     def _on_venta_select(self, _event=None):
-        vid = self._get_selected_venta_id(default=None)
-        if not vid:
+        row = self._get_selected_row()
+        if not row:
             self._limpiar_detalle()
+            self._actualizar_acciones(None)
             self.lbl_seleccion.configure(text="Selecciona una venta para ver productos o aplicar acciones.")
             return
-        venta = self._ventas_cache.get(str(vid), {})
-        cliente = venta.get("cliente") or "Mostrador"
-        total = float(venta.get("total") or 0)
-        pagado = float(venta.get("pagado") or 0)
-        self.lbl_seleccion.configure(
-            text=f"Venta #{vid}  •  {cliente}  •  Total ${total:.2f}  •  Pagado ${pagado:.2f}"
-        )
-        self._cargar_detalle_venta(vid)
+        vid = int(row["venta_id"])
+        cliente = row.get("cliente") or "Mostrador"
+
+        if row.get("kind") == "abono":
+            monto = float(row.get("abono_monto") or 0)
+            saldo = max(float(row.get("total") or 0) - float(row.get("abono_acum") or 0), 0.0)
+            es_liq = row.get("abono_tipo") == "liquidacion"
+            texto_sel = (
+                f"↳ {'Liquidación' if es_liq else 'Abono'} +${monto:.2f}  •  "
+                f"Folio #{vid}  •  {cliente}  •  "
+                + ("Saldó la cuenta" if saldo <= 0.005 else f"Resta ${saldo:.2f}")
+            )
+            if es_liq and row.get("abono_nota"):
+                texto_sel += f"  •  {row['abono_nota']}"
+            self.lbl_seleccion.configure(text=texto_sel)
+            self._cargar_detalle_venta(vid, row)
+            return
+
+        total = float(row.get("total") or 0)
+        pagado = float(row.get("pagado") or 0)
+        texto_sel = f"Venta #{vid}  •  {cliente}  •  Total ${total:.2f}  •  Pagado ${pagado:.2f}"
+        if row.get("devuelta_total"):
+            texto_sel += "  •  ↩ Devuelta por completo"
+        elif row.get("tiene_devoluciones"):
+            texto_sel += "  •  ↩ Con devoluciones"
+        self.lbl_seleccion.configure(text=texto_sel)
+        self._cargar_detalle_venta(vid, row)
 
     # ════════════════════════════════════════════════════════════════════════
     #  DETALLE Y ACCIONES
     # ════════════════════════════════════════════════════════════════════════
-    def _cargar_detalle_venta(self, venta_id: int):
+    def _cargar_detalle_venta(self, venta_id: int, row=None):
+        if row is None:
+            row = self._get_selected_row()
         self._limpiar_detalle()
-        self.lbl_detalle.configure(text=f"Productos de la venta #{venta_id}")
+        self._actualizar_acciones(row)
+        if row and row.get("kind") == "abono":
+            self.lbl_detalle.configure(
+                text=f"Productos del folio #{venta_id}  ·  el abono se edita o elimina desde Abonos"
+            )
+        else:
+            self.lbl_detalle.configure(text=f"Productos de la venta #{venta_id}")
 
         try:
             items = db.obtener_items_venta(venta_id)
@@ -968,7 +1196,8 @@ class VentasView(ctk.CTkFrame):
                     total_fin = float(vrow["total"] or 0)
                     etiq      = vrow["descuento_etiq"] or "Descuento"
                     if sub_orig > 0:
-                        _factor     = total_fin / sub_orig
+                        _factor     = db.factor_descuento_venta(
+                            {"subtotal_orig": sub_orig, "total": total_fin}, items)
                         _tiene_desc = True
                     self.lbl_descuento.configure(
                         text=f"Subtotal: ${sub_orig:.2f}  •  {etiq}: −${desc_monto:.2f}  •  Total: ${total_fin:.2f}"
@@ -986,21 +1215,32 @@ class VentasView(ctk.CTkFrame):
 
         for i, item in enumerate(items):
             tag = "even" if i % 2 == 0 else "odd"
-            precio_unit = round(float(item.get("precio_unitario") or 0) * _factor, 2)
-            subtotal_aj = round(float(item.get("subtotal") or 0) * _factor, 2)
+            _f_item = 1.0 if int(item.get("sin_descuento") or 0) else _factor
+            precio_unit = round(float(item.get("precio_unitario") or 0) * _f_item, 2)
+            subtotal_aj = round(float(item.get("subtotal") or 0) * _f_item, 2)
+            cantidad = int(item.get("cantidad") or 0)
+            devuelta = int(item.get("cantidad_devuelta") or 0)
+            cantidad_txt = f"{cantidad} (devuelta: {devuelta})" if devuelta else str(cantidad)
+            nota_txt = item.get("nota_item", "") or "N/A"
+            if devuelta:
+                # Renglón devuelto: queda bloqueado (solo historial).
+                tag = "devuelto"
+                nota_txt = "↩ Devuelto · bloqueado" + (
+                    "" if nota_txt == "N/A" else f" · {nota_txt}")
             self.detalle_tree.insert(
                 "", "end",
                 values=(
                     item.get("nombre_producto", ""),
                     f"${precio_unit:.2f}",
-                    str(item.get("cantidad", "")),
+                    cantidad_txt,
                     f"${subtotal_aj:.2f}",
-                    item.get("nota_item", "") or "N/A",
+                    nota_txt,
                 ),
                 tags=(tag,)
             )
         self.detalle_tree.tag_configure("even", background=C["bg"])
         self.detalle_tree.tag_configure("odd", background=C["surface2"])
+        self.detalle_tree.tag_configure("devuelto", background="#3b2930", foreground="#ffc2a8")
 
     def _ver_productos_seleccion(self):
         vid = self._get_selected_venta_id(default=None)
@@ -1014,12 +1254,48 @@ class VentasView(ctk.CTkFrame):
         if not vid:
             messagebox.showinfo("Sin selección", "Selecciona una venta primero.", parent=self)
             return
+        row = self._get_selected_row()
+        if row and row.get("kind") == "abono":
+            # Comprobante del abono (mismo que se imprime desde la pestaña Abonos)
+            try:
+                tkt.ticket_desde_abono(int(row["row_id"]), abrir=True)
+            except Exception as e:
+                messagebox.showerror(
+                    "Error al generar ticket",
+                    f"No se pudo generar el comprobante:\n{e}", parent=self
+                )
+            return
         self._reimprimir(vid)
+
+    def _abrir_cuenta_sel(self):
+        vid = self._get_selected_venta_id(default=None)
+        if not vid:
+            messagebox.showinfo("Sin selección", "Selecciona una venta primero.", parent=self)
+            return
+        self._abrir_cuenta(vid)
+
+    def _abrir_cuenta(self, venta_id: int):
+        """Abre el diálogo de la cuenta (el mismo de la pestaña Abonos)."""
+        venta = db.obtener_venta_por_id(venta_id)
+        if venta is None:
+            messagebox.showerror("Error", f"La venta #{venta_id} ya no existe.", parent=self)
+            return
+        if venta["tipo"] != "abono":
+            messagebox.showinfo(
+                "Venta de contado",
+                f"La venta #{venta_id} es de contado y no tiene cuenta de abonos.",
+                parent=self
+            )
+            return
+        from views.abonos import DetalleCuenta
+        DetalleCuenta(self, venta=dict(venta), on_abono=self.cargar_ventas)
 
     def _editar_sel(self):
         vid = self._get_selected_venta_id(default=None)
         if not vid:
             messagebox.showinfo("Sin selección", "Selecciona una venta primero.", parent=self)
+            return
+        if self._venta_bloqueada(vid, "editar"):
             return
         self._editar(vid)
 
@@ -1028,7 +1304,20 @@ class VentasView(ctk.CTkFrame):
         if not vid:
             messagebox.showinfo("Sin selección", "Selecciona una venta primero.", parent=self)
             return
+        if self._venta_bloqueada(vid, "eliminar"):
+            return
         self._eliminar(vid)
+
+    def _devolver_sel(self):
+        vid = self._get_selected_venta_id(default=None)
+        if not vid:
+            messagebox.showinfo("Sin selección", "Selecciona una venta primero.", parent=self)
+            return
+        if self._venta_bloqueada(vid, "devolver"):
+            return
+        # Las devoluciones ahora viven en su propia pestaña (permite devolver
+        # varios productos juntos y ver el reembolso antes de confirmar).
+        self.winfo_toplevel().ir_a_devoluciones(vid)
 
     def _imprimir_cierre(self):
         CierreDialog(self)
@@ -2036,6 +2325,37 @@ class CierreDialog(ctk.CTkToplevel):
                 continue
             ventas.append(v)
 
+        # ── Abonos recibidos en el período (pagos a cuentas a crédito) ────
+        # Son dinero que entró en el período aunque el folio sea de otra fecha.
+        # Se omite el "Anticipo inicial", que ya va dentro de la propia venta.
+        abonos_mov = []
+        if filtro in ("todas", "abono"):
+            conn = sqlite3.connect(db.DB_PATH)
+            conn.row_factory = sqlite3.Row
+            abonos_raw = conn.execute("""
+                SELECT a.id, a.fecha, a.venta_id, v.cliente, a.monto, a.tipo,
+                       a.metodo_pago, a.nota
+                FROM abonos a JOIN ventas v ON v.id = a.venta_id
+                WHERE v.tipo = 'abono'
+                  AND a.tipo IN ('abono', 'liquidacion') AND a.monto > 0
+                  AND NOT (a.tipo = 'abono' AND COALESCE(a.nota, '') = 'Anticipo inicial')
+                ORDER BY a.fecha ASC, a.id ASC
+            """).fetchall()
+            conn.close()
+            for a in abonos_raw:
+                if texto and texto not in (a["cliente"] or "").lower():
+                    continue
+                if not en_periodo(a):
+                    continue
+                abonos_mov.append(a)
+        total_abonos = sum(a["monto"] for a in abonos_mov)
+
+        # Ingreso real del período (mismo cálculo que la tarjeta "Cobrado"):
+        # solo tiene sentido sin filtros de tipo/cliente.
+        ingreso_real = None
+        if filtro == "todas" and not texto:
+            ingreso_real = float(db.resumen_ventas(fecha_desde, fecha_hasta)["monto_cobrado"])
+
         # ── Totales ───────────────────────────────────────────────────────
         total_ventas  = len(ventas)
         total_monto   = sum(v["total"]  for v in ventas)
@@ -2095,9 +2415,17 @@ class CierreDialog(ctk.CTkToplevel):
             ["  · Contado",           str(contado_cnt)],
             ["  · Abono/crédito",     str(abono_cnt)],
             ["Monto total facturado", f"${total_monto:.2f}"],
-            ["Cobrado",               f"${total_cobrado:.2f}"],
+            ["Cobrado (de estas ventas)", f"${total_cobrado:.2f}"],
             ["Pendiente por cobrar",  f"${total_pendiente:.2f}"],
         ]
+        if abonos_mov:
+            resumen_data.append(
+                [f"Abonos recibidos en el período ({len(abonos_mov)})", f"${total_abonos:.2f}"]
+            )
+        if ingreso_real is not None:
+            resumen_data.append(
+                ["Ingreso real del período (ventas + abonos)", f"${ingreso_real:.2f}"]
+            )
 
         AZUL = colors.HexColor("#6c8aff")
         FONDO_HDR = colors.HexColor("#1c2030")
@@ -2119,6 +2447,11 @@ class CierreDialog(ctk.CTkToplevel):
             ("GRID",         (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
             ("FONTNAME",     (0, 4), (0, 6), "Helvetica-Bold"),
         ]))
+        if ingreso_real is not None:
+            t_resumen.setStyle(TableStyle([
+                ("FONTNAME",   (0, -1), (-1, -1), "Helvetica-Bold"),
+                ("LINEABOVE",  (0, -1), (-1, -1), 1.2, AZUL),
+            ]))
         historia.append(t_resumen)
 
         # ── Detalle de ventas ─────────────────────────────────────────────
@@ -2155,6 +2488,41 @@ class CierreDialog(ctk.CTkToplevel):
                 ("GRID",          (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")),
             ]))
             historia.append(t_det)
+
+        # ── Detalle de abonos recibidos ───────────────────────────────────
+        if abonos_mov:
+            historia.append(Spacer(1, 14))
+            historia.append(Paragraph("Abonos recibidos en el período", st_seccion))
+
+            filas_ab = [["Folio", "Fecha", "Cliente", "Método", "Monto"]]
+            for a in abonos_mov:
+                filas_ab.append([
+                    f"#{a['venta_id']}",
+                    a["fecha"][:10],
+                    a["cliente"] or "Mostrador",
+                    (a["metodo_pago"] or "efectivo").capitalize(),
+                    f"${a['monto']:.2f}",
+                ])
+            filas_ab.append(["", "", "", "Total", f"${total_abonos:.2f}"])
+
+            t_ab = Table(filas_ab, colWidths=[1.2*cm, 2.6*cm, None, 2.6*cm, 2.2*cm], repeatRows=1)
+            t_ab.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, 0), AZUL),
+                ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
+                ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE",      (0, 0), (-1, -1), 8),
+                ("ROWBACKGROUNDS",(0, 1), (-1, -2), [colors.white, FONDO_ALT]),
+                ("ALIGN",         (4, 0), (4, -1), "RIGHT"),
+                ("ALIGN",         (0, 0), (0, -1), "CENTER"),
+                ("FONTNAME",      (3, -1), (-1, -1), "Helvetica-Bold"),
+                ("LINEABOVE",     (0, -1), (-1, -1), 0.8, colors.HexColor("#999999")),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
+                ("TOPPADDING",    (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("GRID",          (0, 0), (-1, -2), 0.4, colors.HexColor("#cccccc")),
+            ]))
+            historia.append(t_ab)
 
         # Pie de página — branding
         historia.append(Spacer(1, 24))
