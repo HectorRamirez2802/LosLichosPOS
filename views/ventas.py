@@ -3,7 +3,7 @@ import database as db
 from views import ticket as tkt
 import sqlite3
 import shutil
-from tkinter import messagebox, filedialog, ttk
+from tkinter import messagebox, filedialog, simpledialog, ttk
 
 C = {
     "bg":       "#0d0f14",
@@ -819,7 +819,7 @@ class VentasView(ctk.CTkFrame):
     #  • solo pagos reales (monto > 0) de cuentas a crédito: abonos y liquidaciones
     #  • se omite el "Anticipo inicial": ya forma parte de la propia venta/folio
     _ABONO_BASE = (
-        "v.tipo = 'abono' AND a.tipo IN ('abono', 'liquidacion') AND a.monto > 0 "
+        "v.tipo = 'abono' AND ((a.tipo IN ('abono', 'liquidacion') AND a.monto > 0) OR a.tipo = 'ajuste') "
         "AND NOT (a.tipo = 'abono' AND COALESCE(a.nota, '') = 'Anticipo inicial')"
     )
 
@@ -1029,13 +1029,14 @@ class VentasView(ctk.CTkFrame):
         """Valores de la tabla para un abono (retomada de un folio)."""
         monto = float(d["abono_monto"] or 0)
         saldo = max(float(d["total"] or 0) - float(d["abono_acum"] or 0), 0.0)
-        etiqueta = "↳ Liquid." if d["abono_tipo"] == "liquidacion" else "↳ Abono"
+        signo = "+" if monto >= 0 else "−"
+        etiqueta = {"liquidacion": "↳ Liquid.", "ajuste": "↳ Ajuste"}.get(d["abono_tipo"], "↳ Abono")
         return (
             f"↳ #{int(d['venta_id'])}",
             self._fmt_fecha(d["fecha"]),
             d["cliente"] or "Mostrador",
             "—",
-            f"+${monto:.2f}",
+            f"{signo}${abs(monto):.2f}",
             "—",
             etiqueta,
             self._fmt_metodo(d["metodo_pago"]),
@@ -1131,13 +1132,14 @@ class VentasView(ctk.CTkFrame):
         if row.get("kind") == "abono":
             monto = float(row.get("abono_monto") or 0)
             saldo = max(float(row.get("total") or 0) - float(row.get("abono_acum") or 0), 0.0)
-            es_liq = row.get("abono_tipo") == "liquidacion"
+            etiqueta = {"liquidacion": "Liquidación", "ajuste": "Ajuste"}.get(row.get("abono_tipo"), "Abono")
+            signo = "+" if monto >= 0 else "−"
             texto_sel = (
-                f"↳ {'Liquidación' if es_liq else 'Abono'} +${monto:.2f}  •  "
+                f"↳ {etiqueta} {signo}${abs(monto):.2f}  •  "
                 f"Folio #{vid}  •  {cliente}  •  "
                 + ("Saldó la cuenta" if saldo <= 0.005 else f"Resta ${saldo:.2f}")
             )
-            if es_liq and row.get("abono_nota"):
+            if row.get("abono_nota"):
                 texto_sel += f"  •  {row['abono_nota']}"
             self.lbl_seleccion.configure(text=texto_sel)
             self._cargar_detalle_venta(vid, row)
@@ -1926,7 +1928,9 @@ class EditarVentaDialog(ctk.CTkToplevel):
         conn = sqlite3.connect(db.DB_PATH)
         conn.row_factory = sqlite3.Row
         self._venta = conn.execute(
-            "SELECT * FROM ventas WHERE id = ?", (self.venta_id,)
+            """SELECT v.*, (SELECT ROUND(COALESCE(SUM(monto), 0), 2)
+                             FROM abonos WHERE venta_id = v.id) AS historial
+               FROM ventas v WHERE v.id = ?""", (self.venta_id,)
         ).fetchone()
         conn.close()
 
@@ -1942,7 +1946,7 @@ class EditarVentaDialog(ctk.CTkToplevel):
         ).grid(row=0, column=0, padx=24, pady=(22, 4), sticky="w")
 
         ctk.CTkLabel(
-            self, text="El folio no cambia. Solo se actualizan los datos de la venta.",
+            self, text="Los cambios al importe pagado quedan registrados en la cuenta.",
             font=ctk.CTkFont(size=11), text_color=C["muted"]
         ).grid(row=1, column=0, padx=24, pady=(0, 16), sticky="w")
 
@@ -1983,7 +1987,7 @@ class EditarVentaDialog(ctk.CTkToplevel):
         self.lbl_pagado_warn = ctk.CTkLabel(
             form, text="", font=ctk.CTkFont(size=11), text_color=C["red"]
         )
-        self.lbl_pagado_warn.grid(row=2, column=1, sticky="w")
+        self.lbl_pagado_warn.grid(row=6, column=1, sticky="w")
         self.ent_pagado.bind("<KeyRelease>", self._validar_pagado)
         self.ent_total.bind("<KeyRelease>", self._validar_pagado)
 
@@ -2108,9 +2112,19 @@ class EditarVentaDialog(ctk.CTkToplevel):
             )
             return
 
+        v = self._venta
+        motivo = ""
+        if tipo == v["tipo"] == "abono" and round(pagado - v["historial"], 2):
+            motivo = simpledialog.askstring(
+                "Corrección de pago",
+                f"Historial: ${v['historial']:.2f}  →  Nuevo pagado: ${pagado:.2f}\n"
+                "Motivo del ajuste:", parent=self)
+            if not motivo:
+                return
         try:
+            estado = (v["tipo"], v["total"], v["pagado"], v["historial"])
             db.editar_venta(self.venta_id, cliente, total, pagado, tipo, nota,
-                            self.metodo_var.get())
+                            self.metodo_var.get(), motivo, estado)
             if self.on_save:
                 self.on_save()
             self.destroy()
@@ -2325,20 +2339,18 @@ class CierreDialog(ctk.CTkToplevel):
                 continue
             ventas.append(v)
 
-        # ── Abonos recibidos en el período (pagos a cuentas a crédito) ────
+        # ── Abonos y ajustes del período (pagos a cuentas a crédito) ────
         # Son dinero que entró en el período aunque el folio sea de otra fecha.
         # Se omite el "Anticipo inicial", que ya va dentro de la propia venta.
         abonos_mov = []
         if filtro in ("todas", "abono"):
             conn = sqlite3.connect(db.DB_PATH)
             conn.row_factory = sqlite3.Row
-            abonos_raw = conn.execute("""
+            abonos_raw = conn.execute(f"""
                 SELECT a.id, a.fecha, a.venta_id, v.cliente, a.monto, a.tipo,
                        a.metodo_pago, a.nota
                 FROM abonos a JOIN ventas v ON v.id = a.venta_id
-                WHERE v.tipo = 'abono'
-                  AND a.tipo IN ('abono', 'liquidacion') AND a.monto > 0
-                  AND NOT (a.tipo = 'abono' AND COALESCE(a.nota, '') = 'Anticipo inicial')
+                WHERE {vv._ABONO_BASE}
                 ORDER BY a.fecha ASC, a.id ASC
             """).fetchall()
             conn.close()
@@ -2420,7 +2432,7 @@ class CierreDialog(ctk.CTkToplevel):
         ]
         if abonos_mov:
             resumen_data.append(
-                [f"Abonos recibidos en el período ({len(abonos_mov)})", f"${total_abonos:.2f}"]
+                [f"Abonos y ajustes del período ({len(abonos_mov)})", f"${total_abonos:.2f}"]
             )
         if ingreso_real is not None:
             resumen_data.append(
@@ -2492,7 +2504,7 @@ class CierreDialog(ctk.CTkToplevel):
         # ── Detalle de abonos recibidos ───────────────────────────────────
         if abonos_mov:
             historia.append(Spacer(1, 14))
-            historia.append(Paragraph("Abonos recibidos en el período", st_seccion))
+            historia.append(Paragraph("Abonos y ajustes del período", st_seccion))
 
             filas_ab = [["Folio", "Fecha", "Cliente", "Método", "Monto"]]
             for a in abonos_mov:

@@ -192,7 +192,7 @@ def formatear_bd() -> str:
     2. Borra todos los DEMÁS backups existentes, dejando únicamente
        el respaldo de seguridad recién creado en el paso 1.
     3. Borra todas las tablas de la BD activa.
-    4. Las recrea vacías con db.crear_tablas() + db.migrar_schema().
+    4. Las recrea vacías con db.crear_tablas().
     Devuelve la ruta del backup previo creado (el único que sobrevive).
     """
     # Guardar copia antes de destruir nada
@@ -216,13 +216,13 @@ def formatear_bd() -> str:
         ).fetchall()
         for (tabla,) in tablas:
             conn.execute(f"DROP TABLE IF EXISTS [{tabla}]")
+        conn.execute("PRAGMA user_version = 0")
         conn.commit()
     finally:
         conn.close()
 
     # Recrear esquema limpio
     db.crear_tablas()
-    db.migrar_schema()
 
     return ruta_backup
 

@@ -827,7 +827,11 @@ class EditarAbonoDialog(ctk.CTkToplevel):
             )
             return
 
-        db.editar_abono(self.abono["id"], nuevo, self.metodo_var.get())
+        try:
+            db.editar_abono(self.abono["id"], nuevo, self.metodo_var.get())
+        except ValueError as error:
+            messagebox.showerror("No se modificó el abono", str(error), parent=self)
+            return
         self.on_guardado()
         self.destroy()
 
@@ -1229,7 +1233,7 @@ class DetalleCuenta(ctk.CTkToplevel):
             par  = i % 2 == 0
 
             # Precio unitario ajustado por descuento general
-            p_unit_base = float(item.get("precio_ajustado") or item.get("precio_unitario", 0))
+            p_unit_base = item["precio_unitario"]  # importe unitario registrado al cobrar
             _f_item = 1.0 if int(item.get("sin_descuento") or 0) else _factor
             p_unit = round(p_unit_base * _f_item, 2)
 
@@ -1347,7 +1351,7 @@ class DetalleCuenta(ctk.CTkToplevel):
         confirmar = messagebox.askyesno(
             "Quitar producto",
             f"¿Quitar \"{item['nombre_producto']}\" (×{item['cantidad']}) de esta cuenta?\n\n"
-            f"Se restaurará el stock y se descontará ${item['subtotal']:.2f} del total de la cuenta.",
+            "Se restaurará el stock y se descontará el importe neto del producto.",
             parent=self
         )
         if not confirmar:
@@ -1356,6 +1360,10 @@ class DetalleCuenta(ctk.CTkToplevel):
         def _eliminar_autorizado():
             try:
                 db.eliminar_item_venta(item["id"])
+            except db.RequiereDevolucion as error:
+                if messagebox.askyesno("Se requiere devolución", f"{error}\n\n¿Abrir Devoluciones?", parent=self):
+                    self._abrir_devolucion()
+                return
             except Exception as e:
                 messagebox.showerror("Error", str(e), parent=self)
                 return
@@ -1426,11 +1434,11 @@ class DetalleCuenta(ctk.CTkToplevel):
                     font=ctk.CTkFont(size=10, weight="bold"),
                     text_color=C["yellow"], fg_color="#3a2a00"
                 ).pack(padx=6, pady=2)
-            elif tipo == "devolucion":
+            elif tipo in ("devolucion", "ajuste"):
                 badge = ctk.CTkFrame(left, fg_color="#3a2020", corner_radius=4)
                 badge.pack(anchor="w", pady=(4, 0))
                 ctk.CTkLabel(
-                    badge, text=ab.get("nota") or "Devolución / reembolso",
+                    badge, text=f"Ajuste · {ab['nota']}" if tipo == "ajuste" else ab.get("nota") or "Devolución / reembolso",
                     font=ctk.CTkFont(size=10, weight="bold"),
                     text_color=C["red"], fg_color="#3a2020", wraplength=260
                 ).pack(padx=6, pady=2)
@@ -1464,7 +1472,7 @@ class DetalleCuenta(ctk.CTkToplevel):
                     text_color=C["green"], fg_color=bg
                 ).pack(anchor="w")
             else:
-                es_reembolso = tipo == "devolucion"
+                es_reembolso = ab["monto"] < 0
                 ctk.CTkLabel(
                     center,
                     text=(f"−${abs(ab['monto']):.2f}" if es_reembolso else f"+${ab['monto']:.2f}"),
@@ -1519,7 +1527,7 @@ class DetalleCuenta(ctk.CTkToplevel):
                     command=lambda a=dict(ab): self._editar_abono(a)
                 ).pack(side="left", padx=(0, 4))
 
-            if tipo != "devolucion":
+            if tipo not in ("devolucion", "ajuste"):
                 ctk.CTkButton(
                     btn_frame, text="✕", width=32, height=28,
                     fg_color="#2a1520", hover_color="#3d1f2a",
@@ -1560,7 +1568,12 @@ class DetalleCuenta(ctk.CTkToplevel):
 
         metodo = getattr(self, "metodo_abono_var", None)
         metodo_val = metodo.get() if metodo else "efectivo"
-        db.registrar_abono(self.venta["id"], monto, metodo_pago=metodo_val)
+        try:
+            db.registrar_abono(self.venta["id"], monto, metodo_pago=metodo_val)
+        except ValueError as error:
+            messagebox.showerror("No se registró el abono", str(error), parent=self)
+            self._refresh()
+            return
         messagebox.showinfo("✔ Abono registrado", f"Se registró un abono de ${monto:.2f}")
         self.e_monto.delete(0, "end")
         self._refresh()
@@ -1673,7 +1686,10 @@ class DetalleCuenta(ctk.CTkToplevel):
         )
         if not confirmado:
             return
-        db.eliminar_abono(abono["id"])
+        try:
+            db.eliminar_abono(abono["id"])
+        except ValueError as error:
+            messagebox.showerror("No se eliminó el abono", str(error), parent=self)
         self._refresh()
 
     # ── Refresca datos y redibuja ─────────────────────────────────────────────

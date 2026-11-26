@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 from datetime import datetime
 
+from database import precio_efectivo
+
 from reportlab.lib.units import mm
 from reportlab.lib.pagesizes import landscape
 from reportlab.pdfgen import canvas
@@ -197,7 +199,10 @@ def generar_pdf(venta: dict, items: list, ruta: str | None = None,
 
         nombre_mostrar = truncar_a_ancho(nombre, FONT_NORMAL, 8, ANCHO_UTIL)
         cant    = item["cantidad"]
-        punit   = item.get("precio_ajustado") or item["precio_unitario"]
+        # Para reimpresiones históricas prevalece el precio efectivamente cobrado.
+        punit = item.get("precio_cobrado")
+        if punit is None:
+            punit = precio_efectivo(item["precio_unitario"], item.get("precio_ajustado"))
         sub     = item["subtotal"]
 
         texto(nombre_mostrar, size=8, x=MARGEN)
@@ -277,8 +282,9 @@ def generar_pdf(venta: dict, items: list, ruta: str | None = None,
         texto(f"${pagado_antes_ab:.2f}", size=8, align="right",
               color=HexColor("#888888"))
         nl(10)
-        texto("Este abono:", size=8, bold=True)
-        texto(f"+${monto_ab:.2f}", size=8, bold=True,
+        texto("Ajuste de pago:" if abono_info.get("es_ajuste") else "Este abono:", size=8, bold=True)
+        signo = "+" if monto_ab >= 0 else "−"
+        texto(f"{signo}${abs(monto_ab):.2f}", size=8, bold=True,
               color=HexColor("#4ade80"), align="right")
         nl(10)
         prod_liq = abono_info.get("producto_liquidado", "")
@@ -408,7 +414,7 @@ def ticket_desde_venta_id(venta_id: int, abrir: bool = True) -> str:
 
     # JOIN con productos para traer la categoría de cada ítem
     items = conn.execute("""
-        SELECT vi.*, p.categoria
+        SELECT vi.*, vi.precio_unitario AS precio_cobrado, p.categoria
         FROM venta_items vi
         LEFT JOIN productos p ON p.id = vi.producto_id
         WHERE vi.venta_id = ?
@@ -663,7 +669,7 @@ def ticket_desde_abono(abono_id: int, abrir: bool = True) -> str:
         "SELECT * FROM ventas WHERE id = ?", (abono["venta_id"],)
     ).fetchone()
     items = conn.execute("""
-        SELECT vi.*, p.categoria
+        SELECT vi.*, vi.precio_unitario AS precio_cobrado, p.categoria
         FROM venta_items vi
         LEFT JOIN productos p ON p.id = vi.producto_id
         WHERE vi.venta_id = ?
@@ -714,6 +720,7 @@ def ticket_desde_abono(abono_id: int, abrir: bool = True) -> str:
     abono_info = {
         "monto":        float(abono["monto"]),
         "pagado_antes": pagado_antes,
+        "es_ajuste": abono["tipo"] == "ajuste",
         "fecha_venta":  fecha_venta,
         "producto_liquidado": (abono["nota"] or "") if abono.get("tipo") == "liquidacion" else "",
     }

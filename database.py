@@ -1,8 +1,12 @@
-import sqlite3
+import getpass
+import math
 import os
 import re
+import sqlite3
 import unicodedata
+from contextlib import closing
 from datetime import datetime, timedelta, date
+from pathlib import Path
 
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,9 +31,38 @@ def get_connection():
 
 # ─── CREAR TABLAS ─────────────────────────────────────────────────────────────
 def crear_tablas():
-    conn = get_connection()
-    cursor = conn.cursor()
+    """Inicializa o actualiza toda la base antes de habilitar la caja."""
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > 1:
+            raise ValueError("La base requiere una versión más reciente del sistema.")
+        if version == 1:
+            return
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*' LIMIT 1").fetchone():
+            _respaldar_antes_de_migrar()
+        _crear_tablas(conn)
+        _migrar_columnas(conn)
+        _crear_indices(conn)
+        _normalizar_items_con_devolucion_parcial(conn)
+        conn.execute("PRAGMA user_version = 1")
 
+
+def _respaldar_antes_de_migrar():
+    # La conexión principal conserva el bloqueo de escritura durante la copia.
+    carpeta = Path(DB_PATH).parent / "backups"
+    carpeta.mkdir(exist_ok=True)
+    destino = carpeta / f"pre_migracion_{datetime.now():%Y%m%d_%H%M%S_%f}.db"
+    destino.touch(exist_ok=False)
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as origen, closing(sqlite3.connect(destino)) as copia:
+            origen.backup(copia)
+    except Exception:
+        destino.unlink()
+        raise
+
+
+def _crear_tablas(cursor):
     # PRODUCTOS
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS productos (
@@ -128,14 +161,6 @@ def crear_tablas():
     """)
 
 
-    _crear_indices(cursor)
-
-    conn.commit()
-    conn.close()
-    print("✅ Tablas creadas correctamente.")
-
-
-
 
 def _crear_indices(cursor):
     """Índices idempotentes para que ventas, abonos e inventario escalen mejor."""
@@ -170,71 +195,41 @@ def optimizar_bd():
 
 # ─── MIGRACIÓN (segura e idempotente) ─────────────────────────────────────────
 def migrar_schema():
-    """
-    Añade columnas nuevas a tablas ya existentes sin borrar datos.
-    Es seguro llamarlo siempre al arrancar: si la columna ya existe, no hace nada.
-    """
-    conn = get_connection()
-    cur  = conn.cursor()
+    """Punto de entrada compatible para instalaciones anteriores."""
+    crear_tablas()
 
-    # Esta tabla también se crea durante crear_tablas(), pero repetirla aquí
-    # permite recuperar bases antiguas o instalaciones donde solo se aplicó
-    # parcialmente la actualización del esquema. Debe existir antes de crear
-    # sus índices y antes de que las vistas ejecuten consultas sobre ella.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS devoluciones (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            venta_id        INTEGER NOT NULL,
-            item_id         INTEGER NOT NULL,
-            producto_id     INTEGER NOT NULL,
-            nombre_producto TEXT    NOT NULL,
-            cantidad        INTEGER NOT NULL,
-            importe         REAL    NOT NULL DEFAULT 0,
-            subtotal_bruto  REAL    NOT NULL DEFAULT 0,
-            salida_dinero   REAL    NOT NULL DEFAULT 0,
-            motivo          TEXT    NOT NULL,
-            fecha           TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
-            FOREIGN KEY (venta_id) REFERENCES ventas(id),
-            FOREIGN KEY (item_id) REFERENCES venta_items(id),
-            FOREIGN KEY (producto_id) REFERENCES productos(id)
-        )
-    """)
 
+def _migrar_columnas(cur):
     _asegurar_tabla_caducidades(cur)
 
     migraciones = [
-        ("ALTER TABLE venta_items ADD COLUMN liquidado     INTEGER NOT NULL DEFAULT 0",),
-        ("ALTER TABLE venta_items ADD COLUMN entregado     INTEGER NOT NULL DEFAULT 0",),
-        ("ALTER TABLE venta_items ADD COLUMN entregado_a   TEXT    DEFAULT ''",),
-        ("ALTER TABLE venta_items ADD COLUMN fecha_entrega TEXT    DEFAULT ''",),
-        ("ALTER TABLE abonos      ADD COLUMN tipo          TEXT    NOT NULL DEFAULT 'abono'",),
-        ("ALTER TABLE ventas      ADD COLUMN metodo_pago   TEXT    NOT NULL DEFAULT 'efectivo'",),
-        ("ALTER TABLE abonos      ADD COLUMN metodo_pago   TEXT    NOT NULL DEFAULT 'efectivo'",),
-        ("ALTER TABLE ventas      ADD COLUMN subtotal_orig   REAL DEFAULT 0",),
-        ("ALTER TABLE ventas      ADD COLUMN descuento_monto REAL DEFAULT 0",),
-        ("ALTER TABLE ventas      ADD COLUMN descuento_tipo  TEXT DEFAULT ''",),
-        ("ALTER TABLE ventas      ADD COLUMN descuento_valor REAL DEFAULT 0",),
-        ("ALTER TABLE ventas      ADD COLUMN descuento_etiq  TEXT DEFAULT ''",),
-        ("ALTER TABLE venta_items ADD COLUMN nota_item       TEXT DEFAULT ''",),
-        ("ALTER TABLE venta_items ADD COLUMN precio_ajustado REAL DEFAULT NULL",),
-        # 1 = producto agregado DESPUÉS de aplicado el descuento de la cuenta:
-        # se cobra a precio completo y no participa del factor de descuento.
-        ("ALTER TABLE venta_items ADD COLUMN sin_descuento INTEGER NOT NULL DEFAULT 0",),
-        ("ALTER TABLE ventas      ADD COLUMN telefono        TEXT DEFAULT ''",),
-        ("ALTER TABLE abonos      ADD COLUMN item_id         INTEGER DEFAULT NULL",),
-        ("ALTER TABLE devoluciones ADD COLUMN subtotal_bruto REAL NOT NULL DEFAULT 0",),
+        ("venta_items", "liquidado", "INTEGER NOT NULL DEFAULT 0"),
+        ("venta_items", "entregado", "INTEGER NOT NULL DEFAULT 0"),
+        ("venta_items", "entregado_a", "TEXT    DEFAULT ''"),
+        ("venta_items", "fecha_entrega", "TEXT    DEFAULT ''"),
+        ("abonos", "tipo", "TEXT    NOT NULL DEFAULT 'abono'"),
+        ("ventas", "metodo_pago", "TEXT    NOT NULL DEFAULT 'efectivo'"),
+        ("abonos", "metodo_pago", "TEXT    NOT NULL DEFAULT 'efectivo'"),
+        ("ventas", "subtotal_orig", "REAL DEFAULT 0"),
+        ("ventas", "descuento_monto", "REAL DEFAULT 0"),
+        ("ventas", "descuento_tipo", "TEXT DEFAULT ''"),
+        ("ventas", "descuento_valor", "REAL DEFAULT 0"),
+        ("ventas", "descuento_etiq", "TEXT DEFAULT ''"),
+        ("venta_items", "nota_item", "TEXT DEFAULT ''"),
+        ("venta_items", "precio_ajustado", "REAL DEFAULT NULL"),
+        ("venta_items", "sin_descuento", "INTEGER NOT NULL DEFAULT 0"),
+        ("ventas", "telefono", "TEXT DEFAULT ''"),
+        ("abonos", "item_id", "INTEGER DEFAULT NULL"),
+        ("devoluciones", "subtotal_bruto", "REAL NOT NULL DEFAULT 0"),
     ]
-    for (sql,) in migraciones:
-        try:
-            cur.execute(sql)
-        except sqlite3.OperationalError:
-            pass   # columna ya existe → ignorar
+    for tabla, columna, definicion in migraciones:
+        columnas = {r["name"] for r in cur.execute(f"PRAGMA table_info({tabla})")}
+        if columna not in columnas:
+            cur.execute(f"ALTER TABLE {tabla} ADD COLUMN {columna} {definicion}")
 
-    _crear_indices(cur)
-    _normalizar_items_con_devolucion_parcial(conn)
 
-    conn.commit()
-    conn.close()
+def precio_efectivo(precio_unitario, precio_ajustado):
+    return precio_unitario if precio_ajustado is None else precio_ajustado
 
 
 def factor_descuento_venta(venta, items):
@@ -776,7 +771,7 @@ def registrar_venta(items, tipo="contado", cliente="Mostrador", pagado=None,
 
     Devuelve el ID de la venta creada.
     """
-    subtotal_orig = sum(i["cantidad"] * (i.get("precio_ajustado") or i["precio_unitario"]) for i in items)
+    subtotal_orig = sum(i["cantidad"] * precio_efectivo(i["precio_unitario"], i.get("precio_ajustado")) for i in items)
     desc = descuento or {}
     descuento_monto = desc.get("monto", 0) or 0
     descuento_tipo  = desc.get("tipo", "") or ""
@@ -785,6 +780,8 @@ def registrar_venta(items, tipo="contado", cliente="Mostrador", pagado=None,
     total = max(subtotal_orig - descuento_monto, 0)
     if pagado is None:
         pagado = total
+    if not 0 <= pagado <= total:
+        raise ValueError("El pago debe estar entre cero y el total de la venta.")
 
     conn = get_connection()
     try:
@@ -800,7 +797,7 @@ def registrar_venta(items, tipo="contado", cliente="Mostrador", pagado=None,
         venta_id = cursor.lastrowid
 
         for item in items:
-            precio_u = item.get("precio_ajustado") or item["precio_unitario"]
+            precio_u = precio_efectivo(item["precio_unitario"], item.get("precio_ajustado"))
             subtotal = item["cantidad"] * precio_u
             nota_item = item.get("nota_item", "") or ""
             precio_aj = item.get("precio_ajustado")   # None si no hay ajuste
@@ -863,8 +860,8 @@ def agregar_item_venta(venta_id, producto_id, nombre_producto, cantidad,
 
     Devuelve el ID del venta_items afectado (nuevo o el que se fusionó).
     """
-    precio_efectivo = precio_ajustado if precio_ajustado is not None else precio_unitario
-    subtotal = cantidad * precio_efectivo
+    precio_u = precio_efectivo(precio_unitario, precio_ajustado)
+    subtotal = cantidad * precio_u
     tiene_nota_o_ajuste = bool((nota_item or "").strip()) or precio_ajustado is not None
 
     conn = get_connection()
@@ -909,7 +906,7 @@ def agregar_item_venta(venta_id, producto_id, nombre_producto, cantidad,
                   AND precio_unitario = ?
                   AND sin_descuento = ?
                 ORDER BY id DESC LIMIT 1
-            """, (venta_id, producto_id, precio_efectivo, sin_desc)).fetchone()
+            """, (venta_id, producto_id, precio_u, sin_desc)).fetchone()
 
         if existente:
             item_id = existente["id"]
@@ -926,7 +923,7 @@ def agregar_item_venta(venta_id, producto_id, nombre_producto, cantidad,
                      sin_descuento)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (venta_id, producto_id, nombre_producto, cantidad,
-                  precio_efectivo, subtotal, nota_item or "", precio_ajustado,
+                  precio_u, subtotal, nota_item or "", precio_ajustado,
                   sin_desc))
             item_id = cursor.lastrowid
 
@@ -955,6 +952,10 @@ def agregar_item_venta(venta_id, producto_id, nombre_producto, cantidad,
         conn.close()
 
 
+class RequiereDevolucion(ValueError):
+    """Quitar el artículo exige registrar la salida de dinero."""
+
+
 def eliminar_item_venta(item_id):
     """
     Quita un producto de una cuenta (por ejemplo, si se agregó por error).
@@ -968,6 +969,7 @@ def eliminar_item_venta(item_id):
     """
     conn = get_connection()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         item = conn.execute(
             "SELECT * FROM venta_items WHERE id = ?", (item_id,)
         ).fetchone()
@@ -993,7 +995,7 @@ def eliminar_item_venta(item_id):
             raise ValueError("Este producto ya tiene una devolución registrada y no se puede quitar de la cuenta.")
 
         venta = conn.execute(
-            "SELECT total, subtotal_orig FROM ventas WHERE id = ?",
+            "SELECT total, subtotal_orig, pagado FROM ventas WHERE id = ?",
             (item["venta_id"],)
         ).fetchone()
 
@@ -1008,7 +1010,12 @@ def eliminar_item_venta(item_id):
             neto = float(item["subtotal"])
         else:
             neto = round(float(item["subtotal"]) * _factor_desc_conn(conn, item["venta_id"]), 2)
-        nuevo_total = max(venta["total"] - neto, 0)
+        nuevo_total = max(round(venta["total"] - neto, 2), 0)
+        if round(venta["pagado"], 2) > nuevo_total:
+            raise RequiereDevolucion(
+                "Quitar este producto dejaría dinero a favor del cliente. "
+                "Registra la devolución para calcular y documentar el reembolso."
+            )
 
         conn.execute(
             "UPDATE productos SET stock = stock + ? WHERE id = ?",
@@ -1021,6 +1028,7 @@ def eliminar_item_venta(item_id):
              max(round(nuevo_subtotal_orig - nuevo_total, 2), 0.0), item["venta_id"])
         )
 
+        marcar_items_liquidados_si_saldada(item["venta_id"], conn)
         conn.commit()
         return True
 
@@ -1782,17 +1790,50 @@ def resumen_del_dia():
     return row
 
 
-def editar_venta(venta_id, cliente, total, pagado, tipo, nota, metodo_pago="efectivo"):
+def editar_venta(venta_id, cliente, total, pagado, tipo, nota, metodo_pago="efectivo",
+                 motivo_ajuste="Corrección del importe pagado", estado_esperado=None):
     conn = get_connection()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         if conn.execute("SELECT 1 FROM devoluciones WHERE venta_id = ? LIMIT 1", (venta_id,)).fetchone():
             raise ValueError("No se puede editar una venta con devoluciones registradas.")
-        pagado = min(pagado, total)
+        anterior = conn.execute("SELECT tipo, fecha, total, pagado FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+        if anterior is None:
+            raise ValueError("La venta ya no existe.")
+        if tipo not in ("contado", "abono") or not math.isfinite(total) or not 0 <= pagado <= total:
+            raise ValueError("Revisa el tipo de venta y los importes.")
+        movimientos = conn.execute(
+            "SELECT COUNT(*), ROUND(COALESCE(SUM(monto), 0), 2) FROM abonos WHERE venta_id = ?",
+            (venta_id,)
+        ).fetchone()
+        actual = (anterior["tipo"], anterior["total"], anterior["pagado"], movimientos[1])
+        if estado_esperado is not None and actual != estado_esperado:
+            raise ValueError("La cuenta cambió. Vuelve a abrirla para revisar el saldo actual.")
+        if tipo == "contado" and movimientos[0]:
+            raise ValueError("La cuenta tiene movimientos de abono y debe conservarse a crédito.")
+        if tipo == "abono" and anterior["tipo"] == "abono":
+            diferencia = round(pagado - movimientos[1], 2)
+            if diferencia:
+                if not motivo_ajuste.strip():
+                    raise ValueError("Indica el motivo de la corrección.")
+                conn.execute("""
+                    INSERT INTO abonos (venta_id, monto, nota, tipo, metodo_pago)
+                    VALUES (?, ?, ?, 'ajuste', ?)
+                """, (venta_id, diferencia, f"{motivo_ajuste.strip()} · {getpass.getuser()}", metodo_pago))
+            pagado = round(movimientos[1] + diferencia, 2)
+        elif tipo == "abono" and pagado > 0:
+            # Al reclasificar la venta, el anticipo pertenece al día de la venta original.
+            conn.execute("""
+                INSERT INTO abonos (venta_id, monto, fecha, nota, tipo, metodo_pago)
+                VALUES (?, ?, ?, 'Anticipo inicial', 'abono', ?)
+            """, (venta_id, pagado, anterior["fecha"], metodo_pago))
         conn.execute("""
             UPDATE ventas
             SET cliente = ?, total = ?, pagado = ?, tipo = ?, nota = ?, metodo_pago = ?
             WHERE id = ?
         """, (cliente, total, pagado, tipo, nota, metodo_pago, venta_id))
+        if tipo == "abono":
+            _sincronizar_abonos(conn, venta_id)
         conn.commit()
         return True
     except Exception as e:
@@ -1875,7 +1916,7 @@ def marcar_items_liquidados_si_saldada(venta_id, conn):
     venta = conn.execute(
         "SELECT total, pagado FROM ventas WHERE id = ?", (venta_id,)
     ).fetchone()
-    if venta and venta["pagado"] >= venta["total"]:
+    if venta and round(venta["pagado"], 2) >= round(venta["total"], 2):
         conn.execute(
             """
             UPDATE venta_items SET liquidado = 1
@@ -1888,6 +1929,30 @@ def marcar_items_liquidados_si_saldada(venta_id, conn):
         )
 
 
+def _sincronizar_abonos(conn, venta_id):
+    """El saldo se deriva del historial completo, incluidos ajustes y reembolsos."""
+    cuenta = conn.execute("""
+        SELECT v.total, ROUND(COALESCE(SUM(a.monto), 0), 2) AS pagado
+        FROM ventas v LEFT JOIN abonos a ON a.venta_id = v.id
+        WHERE v.id = ? AND v.tipo = 'abono' GROUP BY v.id
+    """, (venta_id,)).fetchone()
+    if cuenta is None or not 0 <= cuenta["pagado"] <= round(cuenta["total"], 2):
+        raise ValueError("El movimiento dejaría los pagos fuera del total de la cuenta.")
+    conn.execute("UPDATE ventas SET pagado = ? WHERE id = ?", (cuenta["pagado"], venta_id))
+    if cuenta["pagado"] >= round(cuenta["total"], 2):
+        marcar_items_liquidados_si_saldada(venta_id, conn)
+    else:
+        conn.execute("""
+            UPDATE venta_items SET liquidado = 0
+            WHERE venta_id = ? AND liquidado = 1 AND entregado = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM abonos a WHERE a.venta_id = venta_items.venta_id
+                    AND a.tipo = 'liquidacion' AND (a.item_id = venta_items.id OR
+                        (a.item_id IS NULL AND a.nota = venta_items.nombre_producto))
+              )
+        """, (venta_id,))
+
+
 def registrar_abono(venta_id, monto, nota="", metodo_pago="efectivo"):
     """
     Registra un pago parcial normal y actualiza el campo 'pagado' de la venta.
@@ -1896,19 +1961,14 @@ def registrar_abono(venta_id, monto, nota="", metodo_pago="efectivo"):
     """
     conn = get_connection()
     try:
+        if not math.isfinite(monto) or monto <= 0:
+            raise ValueError("El abono debe ser mayor que cero.")
         conn.execute("""
             INSERT INTO abonos (venta_id, monto, nota, tipo, metodo_pago)
             VALUES (?, ?, ?, 'abono', ?)
         """, (venta_id, monto, nota, metodo_pago))
 
-        conn.execute("""
-            UPDATE ventas
-            SET pagado = MIN(total, pagado + ?)
-            WHERE id = ?
-        """, (monto, venta_id))
-
-        marcar_items_liquidados_si_saldada(venta_id, conn)
-
+        _sincronizar_abonos(conn, venta_id)
         conn.commit()
         return True
     except Exception as e:
@@ -1939,16 +1999,18 @@ def editar_abono(abono_id, nuevo_monto, metodo_pago=None):
     """
     conn = get_connection()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT venta_id FROM abonos WHERE id = ?", (abono_id,)
+            "SELECT venta_id, tipo FROM abonos WHERE id = ?", (abono_id,)
         ).fetchone()
         if not row:
             return False
         venta_id = row["venta_id"]
-        tipo_row = conn.execute("SELECT tipo FROM abonos WHERE id = ?", (abono_id,)).fetchone()
-        if tipo_row and tipo_row["tipo"] != "abono":
+        if row["tipo"] != "abono":
             raise ValueError("Solo se pueden editar abonos normales.")
 
+        if not math.isfinite(nuevo_monto) or nuevo_monto <= 0:
+            raise ValueError("El abono debe ser mayor que cero.")
         if metodo_pago is not None:
             conn.execute(
                 "UPDATE abonos SET monto = ?, metodo_pago = ? WHERE id = ?",
@@ -1960,43 +2022,7 @@ def editar_abono(abono_id, nuevo_monto, metodo_pago=None):
                 (nuevo_monto, abono_id)
             )
 
-        conn.execute("""
-            UPDATE ventas
-            SET pagado = MIN(total, (
-                SELECT COALESCE(SUM(monto), 0) FROM abonos WHERE venta_id = ventas.id
-            ))
-            WHERE id = ?
-        """, (venta_id,))
-
-        marcar_items_liquidados_si_saldada(venta_id, conn)
-
-        venta = conn.execute(
-            "SELECT total, pagado FROM ventas WHERE id = ?", (venta_id,)
-        ).fetchone()
-        if venta and venta["pagado"] < venta["total"]:
-            liq_ids = conn.execute("""
-                SELECT vi.id
-                FROM venta_items vi
-                WHERE vi.venta_id = ? AND vi.liquidado = 1
-                  AND EXISTS (
-                      SELECT 1 FROM abonos a
-                      WHERE a.venta_id = ? AND a.tipo = 'liquidacion'
-                        AND (a.item_id = vi.id OR a.nota = vi.nombre_producto)
-                  )
-            """, (venta_id, venta_id)).fetchall()
-            liq_set = {r["id"] for r in liq_ids}
-
-            items_liq = conn.execute(
-                "SELECT id FROM venta_items WHERE venta_id = ? AND liquidado = 1",
-                (venta_id,)
-            ).fetchall()
-            for it in items_liq:
-                if it["id"] not in liq_set:
-                    conn.execute(
-                        "UPDATE venta_items SET liquidado = 0 WHERE id = ?",
-                        (it["id"],)
-                    )
-
+        _sincronizar_abonos(conn, venta_id)
         conn.commit()
         return True
     except Exception as e:
@@ -2015,14 +2041,15 @@ def eliminar_abono(abono_id):
     """
     conn = get_connection()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         abono = conn.execute(
             "SELECT * FROM abonos WHERE id = ?", (abono_id,)
         ).fetchone()
         if not abono:
             return False
 
-        if (abono["tipo"] or "abono") == "devolucion":
-            raise ValueError("Los reembolsos de devolución no se pueden borrar desde el historial de abonos.")
+        if abono["tipo"] in ("devolucion", "ajuste"):
+            raise ValueError("Los ajustes y reembolsos forman parte del historial de la cuenta.")
 
         venta_id = abono["venta_id"]
         tipo     = abono["tipo"] if abono["tipo"] else "abono"
@@ -2054,41 +2081,7 @@ def eliminar_abono(abono_id):
 
         conn.execute("DELETE FROM abonos WHERE id = ?", (abono_id,))
 
-        conn.execute("""
-            UPDATE ventas
-            SET pagado = MIN(total, (
-                SELECT COALESCE(SUM(monto), 0) FROM abonos WHERE venta_id = ventas.id
-            ))
-            WHERE id = ?
-        """, (venta_id,))
-
-        venta = conn.execute(
-            "SELECT total, pagado FROM ventas WHERE id = ?", (venta_id,)
-        ).fetchone()
-        if venta and venta["pagado"] < venta["total"]:
-            liq_ids = conn.execute("""
-                SELECT vi.id
-                FROM venta_items vi
-                WHERE vi.venta_id = ? AND vi.liquidado = 1
-                  AND EXISTS (
-                      SELECT 1 FROM abonos a
-                      WHERE a.venta_id = ? AND a.tipo = 'liquidacion'
-                        AND a.monto = vi.subtotal
-                  )
-            """, (venta_id, venta_id)).fetchall()
-            liq_set = {r["id"] for r in liq_ids}
-
-            items_liq = conn.execute(
-                "SELECT id FROM venta_items WHERE venta_id = ? AND liquidado = 1",
-                (venta_id,)
-            ).fetchall()
-            for it in items_liq:
-                if it["id"] not in liq_set:
-                    conn.execute(
-                        "UPDATE venta_items SET liquidado = 0 WHERE id = ?",
-                        (it["id"],)
-                    )
-
+        _sincronizar_abonos(conn, venta_id)
         conn.commit()
         return True
     except Exception as e:
@@ -2117,7 +2110,13 @@ def liquidar_item(item_id, venta_id, subtotal_producto, nombre_producto,
     """
     conn = get_connection()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        item = conn.execute(
+            "SELECT liquidado FROM venta_items WHERE id = ? AND venta_id = ?", (item_id, venta_id)
+        ).fetchone()
+        if item is None or item["liquidado"]:
+            raise ValueError("El producto ya no está pendiente en esta cuenta.")
 
         if conn.execute(
             "SELECT 1 FROM devoluciones WHERE item_id = ? LIMIT 1", (item_id,)
@@ -2158,19 +2157,13 @@ def liquidar_item(item_id, venta_id, subtotal_producto, nombre_producto,
             VALUES (?, ?, ?, ?, 'liquidacion', ?, ?)
         """, (venta_id, faltante, now, nombre_producto, metodo_pago, item_id))
 
-        if faltante > 0:
-            conn.execute("""
-                UPDATE ventas
-                SET pagado = MIN(total, pagado + ?)
-                WHERE id = ?
-            """, (faltante, venta_id))
 
         conn.execute(
             "UPDATE venta_items SET liquidado = 1 WHERE id = ?",
             (item_id,)
         )
 
-        marcar_items_liquidados_si_saldada(venta_id, conn)
+        _sincronizar_abonos(conn, venta_id)
 
         conn.commit()
         return faltante
@@ -2222,7 +2215,6 @@ def registrar_entrega(item_id, entregado, entregado_a="", fecha_entrega=""):
 if __name__ == "__main__":
     print(f"📂 Base de datos en: {DB_PATH}")
     crear_tablas()
-    migrar_schema()   # aplica columnas nuevas si la DB ya existía
 
     resultado = agregar_producto(
         codigo_barras = "7501234567890",

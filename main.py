@@ -34,7 +34,7 @@ install_global_handler()   # cualquier excepción no capturada → pos.log
 log = get_logger("main")
 
 # ─── RESTO DE IMPORTS ─────────────────────────────────────────────────────────
-from database import crear_tablas, migrar_schema
+from database import crear_tablas
 
 # ─── TEMA ─────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
@@ -126,10 +126,13 @@ class App(ctk.CTk):
 
         try:
             crear_tablas()
-            migrar_schema()
             log.info("Base de datos lista (tablas OK, schema migrado)")
-        except Exception:
+        except Exception as error:
+            from tkinter import messagebox
             log.exception("Error al inicializar la base de datos")
+            messagebox.showerror("No se pudo abrir la caja", str(error), parent=self)
+            self.destroy()
+            raise
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)

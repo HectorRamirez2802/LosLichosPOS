@@ -1590,21 +1590,24 @@ class POSView(ctk.CTkFrame):
             self._seleccionar_indice_carrito(len(self.carrito) - 1)
 
 
-    def _actualizar_totales(self):
-        subtotal  = sum(
-            (i.get("precio_ajustado") or i["producto"]["precio"]) * i["cantidad"]
+    def _subtotal_carrito(self):
+        return sum(
+            db.precio_efectivo(i["producto"]["precio"], i.get("precio_ajustado")) * i["cantidad"]
             for i in self.carrito
         )
+
+    def _actualizar_totales(self):
+        subtotal  = self._subtotal_carrito()
         articulos = sum(i["cantidad"] for i in self.carrito)
 
         # Calcular monto de descuento sobre el subtotal actual
-        if self.descuento and subtotal > 0:
+        if self.descuento:
             tipo = self.descuento.get("tipo", "porcentaje")
             val  = self.descuento.get("valor", 0)
             if tipo == "porcentaje":
                 monto_desc = round(subtotal * val / 100, 2)
             else:
-                monto_desc = min(self.descuento.get("monto", 0), subtotal)
+                monto_desc = min(val, subtotal)
             self.descuento["monto"] = monto_desc   # recalcular por si cambió el carrito
             total = subtotal - monto_desc
         else:
@@ -1632,7 +1635,7 @@ class POSView(ctk.CTkFrame):
                 text_color=C["muted"], hover_color=C["accent"]
             )
 
-        if total > 0:
+        if self.carrito:
             self.lbl_total_grande.configure(text=f"${total:.2f}", text_color=C["green"])
             self.btn_confirmar.configure(
                 state="normal", fg_color=C["green"],
@@ -1652,10 +1655,7 @@ class POSView(ctk.CTkFrame):
         DialogoLogin(self, on_ok=self._abrir_descuento)
 
     def _abrir_descuento(self):
-        subtotal = sum(
-            (i.get("precio_ajustado") or i["producto"]["precio"]) * i["cantidad"]
-            for i in self.carrito
-        )
+        subtotal = self._subtotal_carrito()
         if subtotal <= 0:
             messagebox.showinfo("Sin productos", "Agrega productos al carrito primero.", parent=self)
             return
@@ -1672,19 +1672,13 @@ class POSView(ctk.CTkFrame):
 
     # ── CONFIRMAR VENTA ───────────────────────────────────────────────────────
     def _abrir_dialogo_pago(self):
-        subtotal   = sum(
-            (i.get("precio_ajustado") or i["producto"]["precio"]) * i["cantidad"]
-            for i in self.carrito
-        )
+        subtotal   = self._subtotal_carrito()
         monto_desc = self.descuento.get("monto", 0) if self.descuento else 0
         total      = max(subtotal - monto_desc, 0)
         DialogoPago(self, total=total, on_confirmar=self._procesar_venta)
 
     def _procesar_venta(self, tipo, cliente, pagado, metodo_pago="efectivo", telefono=""):
-        subtotal   = sum(
-            (i.get("precio_ajustado") or i["producto"]["precio"]) * i["cantidad"]
-            for i in self.carrito
-        )
+        subtotal   = self._subtotal_carrito()
         monto_desc = self.descuento.get("monto", 0) if self.descuento else 0
         total      = max(subtotal - monto_desc, 0)
 
@@ -1696,7 +1690,7 @@ class POSView(ctk.CTkFrame):
                 "precio_unitario":  item["producto"]["precio"],
                 "precio_ajustado":  item.get("precio_ajustado"),
                 "nota_item":        item.get("nota", ""),
-                "subtotal":         (item.get("precio_ajustado") or item["producto"]["precio"]) * item["cantidad"],
+                "subtotal":         db.precio_efectivo(item["producto"]["precio"], item.get("precio_ajustado")) * item["cantidad"],
                 "categoria":        (dict(item["producto"]).get("categoria") or ""),
             }
             for item in self.carrito
